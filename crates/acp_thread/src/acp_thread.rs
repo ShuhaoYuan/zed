@@ -815,11 +815,22 @@ pub enum SelectedPermissionParams {
     Terminal { patterns: Vec<String> },
 }
 
+/// Key under which an optional, user-supplied rejection reason is carried in a
+/// `SelectedPermissionOutcome`'s `_meta`. External ACP agents (e.g. claude-acp)
+/// read this to fold the reason into the model-facing denial message, matching
+/// standalone agents' deny-with-reason behavior. The ACP `SelectedPermissionOutcome`
+/// has no dedicated reason field, so `_meta` is the only client→server channel.
+pub const REJECTION_REASON_META_KEY: &str = "rejectionReason";
+
 #[derive(Debug, Clone)]
 pub struct SelectedPermissionOutcome {
     pub option_id: acp::PermissionOptionId,
     pub option_kind: acp::PermissionOptionKind,
     pub params: Option<SelectedPermissionParams>,
+    /// Optional reason the user gave when rejecting the tool call. Forwarded to
+    /// the agent via `_meta` so it can be surfaced to the model. Only meaningful
+    /// for rejections by external ACP agents.
+    pub reason: Option<String>,
 }
 
 impl SelectedPermissionOutcome {
@@ -828,6 +839,7 @@ impl SelectedPermissionOutcome {
             option_id,
             option_kind,
             params: None,
+            reason: None,
         }
     }
 
@@ -835,11 +847,19 @@ impl SelectedPermissionOutcome {
         self.params = params;
         self
     }
+
+    pub fn reason(mut self, reason: Option<String>) -> Self {
+        self.reason = reason;
+        self
+    }
 }
 
 impl From<SelectedPermissionOutcome> for acp::SelectedPermissionOutcome {
     fn from(value: SelectedPermissionOutcome) -> Self {
-        Self::new(value.option_id)
+        let meta = value.reason.map(|reason| {
+            acp::Meta::from_iter([(REJECTION_REASON_META_KEY.into(), reason.into())])
+        });
+        acp::SelectedPermissionOutcome::new(value.option_id).meta(meta)
     }
 }
 
