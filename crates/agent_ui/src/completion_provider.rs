@@ -247,6 +247,7 @@ impl PromptContextType {
 
 pub(crate) enum Match {
     File(FileMatch),
+    ExternalFile(PathBuf),
     Symbol(SymbolMatch),
     Thread(SessionMatch),
     RecentThread(SessionMatch),
@@ -265,6 +266,7 @@ impl Match {
     pub fn score(&self) -> f64 {
         match self {
             Match::File(file) => file.mat.score,
+            Match::ExternalFile(_) => 1.,
             Match::Entry(mode) => mode.mat.as_ref().map(|mat| mat.score).unwrap_or(1.),
             Match::Thread(_) => 1.,
             Match::RecentThread(_) => 1.,
@@ -713,6 +715,53 @@ impl<T: PromptCompletionProviderDelegate> PromptCompletionProvider<T> {
         })
     }
 
+    fn completion_for_external_file_path(
+        abs_path: PathBuf,
+        source_range: Range<Anchor>,
+        source: Arc<T>,
+        editor: WeakEntity<Editor>,
+        mention_set: WeakEntity<MentionSet>,
+        workspace: Entity<Workspace>,
+        label_max_chars: usize,
+        cx: &mut App,
+    ) -> Option<Completion> {
+        let file_name: String = abs_path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .map(|name| name.to_string())
+            .unwrap_or_else(|| abs_path.to_string_lossy().into_owned());
+        let directory = abs_path.parent().and_then(|parent| parent.to_str());
+        let label = build_code_label_for_path(&file_name, directory, None, label_max_chars, cx);
+
+        let uri = MentionUri::File { abs_path };
+        let new_text = format!("{} ", uri.as_link());
+        let new_text_len = new_text.len();
+        let icon_path = uri.icon_path(cx);
+        Some(Completion {
+            replace_range: source_range.clone(),
+            new_text,
+            label,
+            documentation: None,
+            source: project::CompletionSource::Custom,
+            icon_path: Some(icon_path),
+            icon_color: None,
+            match_start: None,
+            snippet_deduplication_key: None,
+            insert_text_mode: None,
+            confirm: Some(confirm_completion_callback(
+                file_name.into(),
+                source_range.start,
+                new_text_len - 1,
+                uri,
+                source,
+                editor,
+                mention_set,
+                workspace,
+            )),
+            group: None,
+        })
+    }
+
     fn completion_for_fetch(
         source_range: Range<Anchor>,
         url_to_fetch: SharedString,
@@ -1031,13 +1080,22 @@ impl<T: PromptCompletionProviderDelegate> PromptCompletionProvider<T> {
         };
         match mode {
             Some(PromptContextType::File) => {
-                let search_files_task = search_files(query, cancellation_flag, &workspace, cx);
+                let search_files_task =
+                    search_files(query.clone(), cancellation_flag, &workspace, cx);
                 cx.background_spawn(async move {
-                    search_files_task
+                    let mut matches: Vec<Match> = search_files_task
                         .await
                         .into_iter()
                         .map(Match::File)
-                        .collect()
+                        .collect();
+                    // Also offer a single absolute path typed verbatim, so that
+                    // files outside the workspace can be referenced directly.
+                    if let Some(abs_path) = parse_absolute_path_query(&query) {
+                        if abs_path.is_file() {
+                            matches.push(Match::ExternalFile(abs_path));
+                        }
+                    }
+                    matches
                 })
             }
 
@@ -1674,6 +1732,18 @@ impl<T: PromptCompletionProviderDelegate> CompletionProvider for PromptCompletio
                                             mention_set.clone(),
                                             workspace.clone(),
                                             project.clone(),
+                                            label_max_chars,
+                                            cx,
+                                        )
+                                    }
+                                    Match::ExternalFile(abs_path) => {
+                                        Self::completion_for_external_file_path(
+                                            abs_path,
+                                            source_range.clone(),
+                                            source.clone(),
+                                            editor.clone(),
+                                            mention_set.clone(),
+                                            workspace.clone(),
                                             label_max_chars,
                                             cx,
                                         )
@@ -2474,6 +2544,37 @@ fn build_slash_item_label(
     // actually matched against.
     builder.respan_filter_range(Some(name));
     builder.build()
+}
+
+/// If `query` looks like an absolute path the user typed verbatim (e.g.
+/// `/etc/hosts`, `~/notes.md`, or a Windows drive path like `C:\\foo`), returns
+/// the resolved path. Relative paths are intentionally not matched — they're
+/// ambiguous with ordinary fuzzy file queries, and a picker covers that case.
+fn parse_absolute_path_query(query: &str) -> Option<PathBuf> {
+    let query = query.trim();
+    if query.is_empty() {
+        return None;
+    }
+    let resolved = if query == "~" {
+        util::paths::home_dir().clone()
+    } else if let Some(rest) = query.strip_prefix("~/") {
+        util::paths::home_dir().join(rest)
+    } else if query.starts_with('/') {
+        PathBuf::from(query)
+    } else if is_windows_drive_path(query) {
+        PathBuf::from(query)
+    } else {
+        return None;
+    };
+    Some(resolved)
+}
+
+fn is_windows_drive_path(path: &str) -> bool {
+    let bytes = path.as_bytes();
+    bytes.len() >= 3
+        && bytes[0].is_ascii_alphabetic()
+        && bytes[1] == b':'
+        && (bytes[2] == b'\\' || bytes[2] == b'/')
 }
 
 fn build_code_label_for_path(

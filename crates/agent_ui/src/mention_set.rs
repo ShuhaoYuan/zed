@@ -391,50 +391,81 @@ impl MentionSet {
             return Task::ready(Err(anyhow!("project not found")));
         };
 
-        let Some(project_path) = project
+        let project_path = project
             .read(cx)
-            .project_path_for_absolute_path(&abs_path, cx)
-        else {
-            return Task::ready(Err(anyhow!("project path not found")));
-        };
+            .project_path_for_absolute_path(&abs_path, cx);
 
         if is_raster_image_path(&abs_path) {
             if !supports_images {
                 return Task::ready(Err(anyhow!("This model does not support images yet")));
             }
-            let task = project.update(cx, |project, cx| project.open_image(project_path, cx));
-            return cx.spawn(async move |_, cx| {
-                let image = task.await?;
-                let image = image.update(cx, |image, _| image.image.clone());
-                let image = cx
-                    .update(|cx| LanguageModelImage::from_image(image, cx))
-                    .await;
-                if let Some(image) = image {
-                    Ok(Mention::Image(MentionImage {
-                        data: image.source,
-                        format: LanguageModelImage::FORMAT,
-                    }))
-                } else {
-                    Err(anyhow!("Failed to convert image"))
+            // Images inside a worktree are opened through the project (tracked).
+            // Images outside the project are read straight from disk.
+            return match project_path {
+                Some(project_path) => {
+                    let task =
+                        project.update(cx, |project, cx| project.open_image(project_path, cx));
+                    cx.spawn(async move |_, cx| {
+                        let image = task.await?;
+                        let image = image.update(cx, |image, _| image.image.clone());
+                        let image = cx
+                            .update(|cx| LanguageModelImage::from_image(image, cx))
+                            .await;
+                        Self::image_to_mention(image)
+                    })
                 }
-            });
+                None => cx.spawn(async move |_, cx| {
+                    let (image, _name) = load_external_image_from_path(&abs_path, &"Image".into())
+                        .ok_or_else(|| {
+                            anyhow!("Failed to read image {}", abs_path.display())
+                        })?;
+                    let image = Arc::new(image);
+                    let image = cx
+                        .update(|cx| LanguageModelImage::from_image(image, cx))
+                        .await;
+                    Self::image_to_mention(image)
+                }),
+            };
         }
 
-        let buffer = project.update(cx, |project, cx| project.open_buffer(project_path, cx));
-        cx.spawn(async move |_, cx| {
-            let buffer = buffer.await?;
-            let buffer_content = outline::get_buffer_content_or_outline(
-                buffer.clone(),
-                Some(&abs_path.to_string_lossy()),
-                &cx,
-            )
-            .await?;
+        match project_path {
+            Some(project_path) => {
+                let buffer =
+                    project.update(cx, |project, cx| project.open_buffer(project_path, cx));
+                cx.spawn(async move |_, cx| {
+                    let buffer = buffer.await?;
+                    let buffer_content = outline::get_buffer_content_or_outline(
+                        buffer.clone(),
+                        Some(&abs_path.to_string_lossy()),
+                        &cx,
+                    )
+                    .await?;
 
-            Ok(Mention::Text {
-                content: buffer_content.text,
-                tracked_buffers: vec![buffer],
-            })
-        })
+                    Ok(Mention::Text {
+                        content: buffer_content.text,
+                        tracked_buffers: vec![buffer],
+                    })
+                })
+            }
+            // A file that lives outside any worktree: read it straight from disk
+            // as a read-only snapshot (no tracked buffer), like skill files.
+            None => cx.background_spawn(async move {
+                let content = std::fs::read_to_string(&abs_path)
+                    .map_err(|e| anyhow!("Failed to read file {}: {}", abs_path.display(), e))?;
+                Ok(Mention::Text {
+                    content,
+                    tracked_buffers: Vec::new(),
+                })
+            }),
+        }
+    }
+
+    fn image_to_mention(image: Option<LanguageModelImage>) -> Result<Mention> {
+        let image = image.ok_or_else(|| anyhow!("Failed to convert image"))?;
+        Ok(Mention::Image(MentionImage {
+            data: image.source,
+            format: LanguageModelImage::FORMAT,
+        }))
     }
 
     fn confirm_mention_for_fetch(
@@ -911,6 +942,112 @@ pub(crate) async fn insert_images_as_context(
                 MentionUri::PastedImage {
                     name: name.to_string(),
                 },
+                task.clone(),
+                crease_entity,
+                cx,
+            )
+        });
+
+        if task
+            .await
+            .notify_workspace_async_err(workspace.clone(), cx)
+            .is_none()
+        {
+            editor.update(cx, |editor, cx| {
+                editor.edit([(start_anchor..end_anchor, "")], cx);
+            });
+            mention_set.update(cx, |mention_set, cx| {
+                mention_set.remove_mention(&crease_id, cx)
+            });
+        }
+    }
+}
+
+/// Inserts each given file path as a context mention at the editor's cursor,
+/// reading files that live outside any worktree straight from disk. Mirrors
+/// `insert_images_as_context`, but for arbitrary files chosen via a picker.
+pub(crate) async fn insert_files_as_context(
+    paths: Vec<PathBuf>,
+    editor: Entity<Editor>,
+    mention_set: Entity<MentionSet>,
+    workspace: WeakEntity<Workspace>,
+    supports_images: bool,
+    cx: &mut gpui::AsyncWindowContext,
+) {
+    if paths.is_empty() {
+        return;
+    }
+
+    for abs_path in paths {
+        let mention_uri = MentionUri::File {
+            abs_path: abs_path.clone(),
+        };
+        let replacement_text = mention_uri.as_link().to_string();
+        let Some((text_anchor, multibuffer_anchor)) = editor
+            .update_in(cx, |editor, window, cx| {
+                let snapshot = editor.snapshot(window, cx);
+                let (cursor_anchor, buffer_snapshot) = snapshot
+                    .buffer_snapshot()
+                    .anchor_to_buffer_anchor(editor.selections.newest_anchor().start)
+                    .unwrap();
+                let text_anchor = cursor_anchor.bias_left(buffer_snapshot);
+                let multibuffer_anchor = snapshot.buffer_snapshot().anchor_in_excerpt(text_anchor);
+                editor.insert(&format!("{replacement_text} "), window, cx);
+                (text_anchor, multibuffer_anchor)
+            })
+            .ok()
+        else {
+            break;
+        };
+
+        let content_len = replacement_text.len();
+        let Some(start_anchor) = multibuffer_anchor else {
+            continue;
+        };
+        let end_anchor = editor.update(cx, |editor, cx| {
+            let snapshot = editor.buffer().read(cx).snapshot(cx);
+            snapshot.anchor_before(start_anchor.to_offset(&snapshot) + content_len)
+        });
+
+        let crease_label: SharedString = abs_path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .map(|name| name.to_string().into())
+            .unwrap_or_else(|| abs_path.to_string_lossy().into());
+
+        let Ok(Some((crease_id, tx, crease_entity))) = cx.update(|window, cx| {
+            insert_crease_for_mention(
+                text_anchor,
+                content_len,
+                crease_label,
+                mention_uri.icon_path(cx),
+                None,
+                Some(mention_uri.clone()),
+                Some(workspace.clone()),
+                None,
+                editor.clone(),
+                window,
+                cx,
+            )
+        }) else {
+            continue;
+        };
+
+        let file_task = mention_set.update(cx, |mention_set, cx| {
+            mention_set.confirm_mention_for_file(abs_path.clone(), supports_images, cx)
+        });
+        let task = cx
+            .spawn(async move |_| {
+                let mention = file_task.await.map_err(|e| e.to_string());
+                drop(tx);
+                mention
+            })
+            .shared();
+
+        mention_set.update(cx, |mention_set, cx| {
+            mention_set.insert_mention(
+                crease_id,
+                mention_uri.clone(),
                 task.clone(),
                 crease_entity,
                 cx,
