@@ -963,112 +963,6 @@ pub(crate) async fn insert_images_as_context(
     }
 }
 
-/// Inserts each given file path as a context mention at the editor's cursor,
-/// reading files that live outside any worktree straight from disk. Mirrors
-/// `insert_images_as_context`, but for arbitrary files chosen via a picker.
-pub(crate) async fn insert_files_as_context(
-    paths: Vec<PathBuf>,
-    editor: Entity<Editor>,
-    mention_set: Entity<MentionSet>,
-    workspace: WeakEntity<Workspace>,
-    supports_images: bool,
-    cx: &mut gpui::AsyncWindowContext,
-) {
-    if paths.is_empty() {
-        return;
-    }
-
-    for abs_path in paths {
-        let mention_uri = MentionUri::File {
-            abs_path: abs_path.clone(),
-        };
-        let replacement_text = mention_uri.as_link().to_string();
-        let Some((text_anchor, multibuffer_anchor)) = editor
-            .update_in(cx, |editor, window, cx| {
-                let snapshot = editor.snapshot(window, cx);
-                let (cursor_anchor, buffer_snapshot) = snapshot
-                    .buffer_snapshot()
-                    .anchor_to_buffer_anchor(editor.selections.newest_anchor().start)
-                    .unwrap();
-                let text_anchor = cursor_anchor.bias_left(buffer_snapshot);
-                let multibuffer_anchor = snapshot.buffer_snapshot().anchor_in_excerpt(text_anchor);
-                editor.insert(&format!("{replacement_text} "), window, cx);
-                (text_anchor, multibuffer_anchor)
-            })
-            .ok()
-        else {
-            break;
-        };
-
-        let content_len = replacement_text.len();
-        let Some(start_anchor) = multibuffer_anchor else {
-            continue;
-        };
-        let end_anchor = editor.update(cx, |editor, cx| {
-            let snapshot = editor.buffer().read(cx).snapshot(cx);
-            snapshot.anchor_before(start_anchor.to_offset(&snapshot) + content_len)
-        });
-
-        let crease_label: SharedString = abs_path
-            .file_name()
-            .and_then(|name| name.to_str())
-            .map(|name| name.to_string().into())
-            .unwrap_or_else(|| abs_path.to_string_lossy().into());
-
-        let Ok(Some((crease_id, tx, crease_entity))) = cx.update(|window, cx| {
-            insert_crease_for_mention(
-                text_anchor,
-                content_len,
-                crease_label,
-                mention_uri.icon_path(cx),
-                None,
-                Some(mention_uri.clone()),
-                Some(workspace.clone()),
-                None,
-                editor.clone(),
-                window,
-                cx,
-            )
-        }) else {
-            continue;
-        };
-
-        let file_task = mention_set.update(cx, |mention_set, cx| {
-            mention_set.confirm_mention_for_file(abs_path.clone(), supports_images, cx)
-        });
-        let task = cx
-            .spawn(async move |_| {
-                let mention = file_task.await.map_err(|e| e.to_string());
-                drop(tx);
-                mention
-            })
-            .shared();
-
-        mention_set.update(cx, |mention_set, cx| {
-            mention_set.insert_mention(
-                crease_id,
-                mention_uri.clone(),
-                task.clone(),
-                crease_entity,
-                cx,
-            )
-        });
-
-        if task
-            .await
-            .notify_workspace_async_err(workspace.clone(), cx)
-            .is_none()
-        {
-            editor.update(cx, |editor, cx| {
-                editor.edit([(start_anchor..end_anchor, "")], cx);
-            });
-            mention_set.update(cx, |mention_set, cx| {
-                mention_set.remove_mention(&crease_id, cx)
-            });
-        }
-    }
-}
-
 fn image_format_from_external_content(format: image::ImageFormat) -> Option<ImageFormat> {
     match format {
         image::ImageFormat::Png => Some(ImageFormat::Png),
@@ -1316,11 +1210,13 @@ fn full_mention_for_directory(
         files
     }
 
-    let Some(project_path) = project
+    let project_path = project
         .read(cx)
-        .project_path_for_absolute_path(&abs_path, cx)
-    else {
-        return Task::ready(Err(anyhow!("project path not found")));
+        .project_path_for_absolute_path(&abs_path, cx);
+    let Some(project_path) = project_path else {
+        // The directory lives outside every worktree: walk the filesystem
+        // directly and embed its files as a read-only snapshot.
+        return full_mention_for_external_directory(abs_path.to_path_buf(), cx);
     };
     let Some(entry) = project.read(cx).entry_for_path(&project_path, cx) else {
         return Task::ready(Err(anyhow!("project entry not found")));
@@ -1386,6 +1282,59 @@ fn full_mention_for_directory(
             })
             .await;
         anyhow::Ok(contents)
+    })
+}
+
+/// Like `full_mention_for_directory`, but for a directory that lives outside
+/// every worktree. Walks the filesystem directly (no tracked buffers) and embeds
+/// the readable text files as a read-only snapshot, matching how external file
+/// mentions behave. Bounded to avoid embedding arbitrarily large trees.
+fn full_mention_for_external_directory(abs_path: PathBuf, cx: &mut App) -> Task<Result<Mention>> {
+    const MAX_FILES: usize = 100;
+    const MAX_FILE_BYTES: u64 = 256 * 1024;
+
+    cx.background_spawn(async move {
+        let mut entries: Vec<(Arc<RelPath>, String, String)> = Vec::new();
+        let mut stack = vec![abs_path];
+
+        while let Some(directory) = stack.pop() {
+            let Ok(directory_entries) = std::fs::read_dir(&directory) else {
+                continue;
+            };
+            for entry in directory_entries.flatten() {
+                if entries.len() >= MAX_FILES {
+                    break;
+                }
+                let Ok(file_type) = entry.file_type() else {
+                    continue;
+                };
+                let path = entry.path();
+                if file_type.is_dir() {
+                    stack.push(path);
+                } else if file_type.is_file() {
+                    let Ok(metadata) = entry.metadata() else {
+                        continue;
+                    };
+                    if metadata.len() > MAX_FILE_BYTES {
+                        continue;
+                    }
+                    let Ok(content) = std::fs::read_to_string(&path) else {
+                        continue;
+                    };
+                    entries.push((
+                        RelPath::empty_arc(),
+                        path.to_string_lossy().into_owned(),
+                        content,
+                    ));
+                }
+            }
+        }
+
+        entries.sort_by(|a, b| a.1.cmp(&b.1));
+        Ok(Mention::Text {
+            content: render_directory_contents(entries),
+            tracked_buffers: Vec::new(),
+        })
     })
 }
 

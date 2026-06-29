@@ -1633,40 +1633,6 @@ impl MessageEditor {
             .detach_and_log_err(cx);
     }
 
-    pub fn add_files_from_picker(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let editor = self.editor.clone();
-        let mention_set = self.mention_set.clone();
-        let workspace = self.workspace.clone();
-        let supports_images = self.session_capabilities.read().supports_images();
-
-        let paths_receiver = cx.prompt_for_paths(gpui::PathPromptOptions {
-            files: true,
-            directories: false,
-            multiple: true,
-            prompt: Some("Select Files".into()),
-        });
-
-        window
-            .spawn(cx, async move |cx| {
-                let paths = match paths_receiver.await {
-                    Ok(Ok(Some(paths))) => paths,
-                    _ => return Ok::<(), anyhow::Error>(()),
-                };
-
-                crate::mention_set::insert_files_as_context(
-                    paths,
-                    editor,
-                    mention_set,
-                    workspace,
-                    supports_images,
-                    cx,
-                )
-                .await;
-                Ok(())
-            })
-            .detach_and_log_err(cx);
-    }
-
     pub fn set_read_only(&mut self, read_only: bool, cx: &mut Context<Self>) {
         self.editor.update(cx, |message_editor, cx| {
             message_editor.set_read_only(read_only);

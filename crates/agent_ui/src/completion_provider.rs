@@ -1,6 +1,6 @@
 use std::cmp::Reverse;
 use std::ops::Range;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 
@@ -248,6 +248,7 @@ impl PromptContextType {
 pub(crate) enum Match {
     File(FileMatch),
     ExternalFile(PathBuf),
+    ExternalDirectory(PathBuf),
     Symbol(SymbolMatch),
     Thread(SessionMatch),
     RecentThread(SessionMatch),
@@ -267,6 +268,7 @@ impl Match {
         match self {
             Match::File(file) => file.mat.score,
             Match::ExternalFile(_) => 1.,
+            Match::ExternalDirectory(_) => 1.,
             Match::Entry(mode) => mode.mat.as_ref().map(|mat| mat.score).unwrap_or(1.),
             Match::Thread(_) => 1.,
             Match::RecentThread(_) => 1.,
@@ -762,6 +764,54 @@ impl<T: PromptCompletionProviderDelegate> PromptCompletionProvider<T> {
         })
     }
 
+    fn completion_for_external_directory_path(
+        abs_path: PathBuf,
+        source_range: Range<Anchor>,
+        source: Arc<T>,
+        editor: WeakEntity<Editor>,
+        mention_set: WeakEntity<MentionSet>,
+        workspace: Entity<Workspace>,
+        label_max_chars: usize,
+        cx: &mut App,
+    ) -> Option<Completion> {
+        let directory_name: String = abs_path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .map(|name| name.to_string())
+            .unwrap_or_else(|| abs_path.to_string_lossy().into_owned());
+        let directory = abs_path.parent().and_then(|parent| parent.to_str());
+        let label =
+            build_code_label_for_path(&directory_name, directory, None, label_max_chars, cx);
+
+        let uri = MentionUri::Directory { abs_path };
+        let new_text = format!("{} ", uri.as_link());
+        let new_text_len = new_text.len();
+        let icon_path = uri.icon_path(cx);
+        Some(Completion {
+            replace_range: source_range.clone(),
+            new_text,
+            label,
+            documentation: None,
+            source: project::CompletionSource::Custom,
+            icon_path: Some(icon_path),
+            icon_color: None,
+            match_start: None,
+            snippet_deduplication_key: None,
+            insert_text_mode: None,
+            confirm: Some(confirm_completion_callback(
+                directory_name.into(),
+                source_range.start,
+                new_text_len - 1,
+                uri,
+                source,
+                editor,
+                mention_set,
+                workspace,
+            )),
+            group: None,
+        })
+    }
+
     fn completion_for_fetch(
         source_range: Range<Anchor>,
         url_to_fetch: SharedString,
@@ -1080,22 +1130,31 @@ impl<T: PromptCompletionProviderDelegate> PromptCompletionProvider<T> {
         };
         match mode {
             Some(PromptContextType::File) => {
-                let search_files_task =
-                    search_files(query.clone(), cancellation_flag, &workspace, cx);
+                // When the query looks like a filesystem path (`/abs`, `~/...`,
+                // `../`, `./`), browse that location directly instead of fuzzy
+                // searching the workspace, so files and directories outside the
+                // workspace can be referenced. Relative paths resolve against the
+                // first visible worktree's root.
+                let base_dir = workspace
+                    .read(cx)
+                    .visible_worktrees(cx)
+                    .next()
+                    .map(|worktree| worktree.read(cx).abs_path());
+                let ends_with_separator = query.ends_with('/') || query.ends_with('\\');
+                if let Some(base_dir) = base_dir
+                    && let Some(resolved) = parse_path_query(&query, &base_dir)
+                {
+                    return cx.background_spawn(async move {
+                        browse_external_path(resolved, ends_with_separator)
+                    });
+                }
+                let search_files_task = search_files(query, cancellation_flag, &workspace, cx);
                 cx.background_spawn(async move {
-                    let mut matches: Vec<Match> = search_files_task
+                    search_files_task
                         .await
                         .into_iter()
                         .map(Match::File)
-                        .collect();
-                    // Also offer a single absolute path typed verbatim, so that
-                    // files outside the workspace can be referenced directly.
-                    if let Some(abs_path) = parse_absolute_path_query(&query) {
-                        if abs_path.is_file() {
-                            matches.push(Match::ExternalFile(abs_path));
-                        }
-                    }
-                    matches
+                        .collect()
                 })
             }
 
@@ -1738,6 +1797,18 @@ impl<T: PromptCompletionProviderDelegate> CompletionProvider for PromptCompletio
                                     }
                                     Match::ExternalFile(abs_path) => {
                                         Self::completion_for_external_file_path(
+                                            abs_path,
+                                            source_range.clone(),
+                                            source.clone(),
+                                            editor.clone(),
+                                            mention_set.clone(),
+                                            workspace.clone(),
+                                            label_max_chars,
+                                            cx,
+                                        )
+                                    }
+                                    Match::ExternalDirectory(abs_path) => {
+                                        Self::completion_for_external_directory_path(
                                             abs_path,
                                             source_range.clone(),
                                             source.clone(),
@@ -2550,7 +2621,13 @@ fn build_slash_item_label(
 /// `/etc/hosts`, `~/notes.md`, or a Windows drive path like `C:\\foo`), returns
 /// the resolved path. Relative paths are intentionally not matched — they're
 /// ambiguous with ordinary fuzzy file queries, and a picker covers that case.
-fn parse_absolute_path_query(query: &str) -> Option<PathBuf> {
+/// Parses a query typed after `@` into an absolute filesystem path.
+///
+/// Recognizes `~` / `~/...` (home), absolute paths (`/...`, Windows drive),
+/// and workspace-relative paths (`./`, `../`, `.`, `..`), which resolve against
+/// `base_dir`. Returns `None` for anything else so the normal fuzzy workspace
+/// search still applies.
+fn parse_path_query(query: &str, base_dir: &Path) -> Option<PathBuf> {
     let query = query.trim();
     if query.is_empty() {
         return None;
@@ -2563,10 +2640,116 @@ fn parse_absolute_path_query(query: &str) -> Option<PathBuf> {
         PathBuf::from(query)
     } else if is_windows_drive_path(query) {
         PathBuf::from(query)
+    } else if query.starts_with("./")
+        || query.starts_with("../")
+        || query == "."
+        || query == ".."
+    {
+        lexically_normalize(&base_dir.join(query))
     } else {
         return None;
     };
     Some(resolved)
+}
+
+/// Lexically collapses `.` and `..` components without touching the filesystem
+/// (so partially-typed paths like `../nonexistent` still resolve to their
+/// parent directory for browsing).
+fn lexically_normalize(path: &Path) -> PathBuf {
+    use std::path::Component;
+    let mut out = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                if matches!(out.components().next_back(), Some(Component::Normal(_))) {
+                    out.pop();
+                }
+                // Otherwise we're at a root/prefix and can't climb further lexically.
+            }
+            other => out.push(other.as_os_str()),
+        }
+    }
+    out
+}
+
+/// Builds completion matches for a path typed after `@` that lives outside the
+/// workspace. Offers the resolved file (or directory, when the query ends in a
+/// separator) directly, and lists the directory the query points into, filtered
+/// by the trailing path component the user has typed so far.
+fn browse_external_path(resolved: PathBuf, ends_with_separator: bool) -> Vec<Match> {
+    const MAX_CHILDREN: usize = 200;
+
+    let mut matches: Vec<Match> = Vec::new();
+
+    if resolved.is_file() {
+        matches.push(Match::ExternalFile(resolved.clone()));
+    }
+    if ends_with_separator && resolved.is_dir() {
+        matches.push(Match::ExternalDirectory(resolved.clone()));
+    }
+
+    let (list_dir, prefix): (PathBuf, String) = if ends_with_separator {
+        (resolved.clone(), String::new())
+    } else {
+        let prefix = resolved
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("")
+            .to_lowercase();
+        (
+            resolved
+                .parent()
+                .unwrap_or_else(|| Path::new(""))
+                .to_path_buf(),
+            prefix,
+        )
+    };
+
+    if list_dir.is_dir()
+        && let Ok(entries) = std::fs::read_dir(&list_dir)
+    {
+        let mut children: Vec<(PathBuf, bool)> = entries
+            .filter_map(|entry| entry.ok())
+            .filter_map(|entry| {
+                let file_type = entry.file_type().ok()?;
+                let is_dir = file_type.is_dir();
+                if !is_dir && !file_type.is_file() {
+                    return None;
+                }
+                Some((entry.path(), is_dir))
+            })
+            .collect();
+        children.sort_by(|a, b| {
+            a.0.file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or("")
+                .cmp(
+                    b.0.file_name()
+                        .and_then(|name| name.to_str())
+                        .unwrap_or(""),
+                )
+        });
+
+        for (child, is_dir) in children.into_iter().take(MAX_CHILDREN) {
+            if child == resolved {
+                continue;
+            }
+            let Some(name) = child.file_name().and_then(|name| name.to_str()) else {
+                continue;
+            };
+            if !prefix.is_empty() && !name.to_lowercase().starts_with(&prefix) {
+                continue;
+            }
+            if is_dir {
+                matches.push(Match::ExternalDirectory(child));
+            } else {
+                matches.push(Match::ExternalFile(child));
+            }
+        }
+    }
+
+    matches
 }
 
 fn is_windows_drive_path(path: &str) -> bool {
@@ -2828,6 +3011,49 @@ fn completion_text_for_terminal_selections(
 mod tests {
     use super::*;
     use gpui::TestAppContext;
+
+    #[test]
+    fn test_parse_path_query() {
+        let base = Path::new("/projects/zed");
+
+        // Relative `..` resolves against the base and collapses lexically, so
+        // `@../` reaches the workspace's parent and `@../../` its grandparent.
+        assert_eq!(parse_path_query("..", base), Some(PathBuf::from("/projects")));
+        assert_eq!(parse_path_query("../../src", base), Some(PathBuf::from("/src")));
+        assert_eq!(
+            parse_path_query("./crates", base),
+            Some(PathBuf::from("/projects/zed/crates"))
+        );
+
+        // Absolute paths are taken verbatim.
+        assert_eq!(
+            parse_path_query("/home/user/file.rs", base),
+            Some(PathBuf::from("/home/user/file.rs"))
+        );
+
+        // `~` resolves under the home directory.
+        let home = util::paths::home_dir().clone();
+        assert_eq!(parse_path_query("~", base), Some(home.clone()));
+        assert_eq!(parse_path_query("~/tmp", base), Some(home.join("tmp")));
+
+        // A bare name is not a path query — the fuzzy workspace search handles it.
+        assert_eq!(parse_path_query("main.rs", base), None);
+        assert_eq!(parse_path_query("", base), None);
+    }
+
+    #[test]
+    fn test_lexically_normalize() {
+        assert_eq!(
+            lexically_normalize(Path::new("/a/b/../c")),
+            PathBuf::from("/a/c")
+        );
+        assert_eq!(lexically_normalize(Path::new("/a/./b")), PathBuf::from("/a/b"));
+        // `..` past the root is clamped, not accumulated.
+        assert_eq!(
+            lexically_normalize(Path::new("/a/../../b")),
+            PathBuf::from("/b")
+        );
+    }
 
     #[test]
     fn test_prompt_completion_parse() {
