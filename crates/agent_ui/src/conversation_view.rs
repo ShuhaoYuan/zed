@@ -389,6 +389,7 @@ impl Conversation {
         &mut self,
         session_id: &acp::SessionId,
         kind: acp::PermissionOptionKind,
+        edited_command: Option<String>,
         cx: &mut Context<Self>,
     ) -> Option<()> {
         let (authorize_session_id, tool_call_id, options) =
@@ -398,6 +399,7 @@ impl Conversation {
             authorize_session_id,
             tool_call_id,
             SelectedPermissionOutcome::new(option.option_id.clone(), option.kind),
+            edited_command,
             cx,
         );
         Some(())
@@ -409,12 +411,13 @@ impl Conversation {
         tool_call_id: acp::ToolCallId,
         selection: Option<&thread_view::PermissionSelection>,
         is_allow: bool,
+        edited_command: Option<String>,
         cx: &mut Context<Self>,
     ) -> Option<()> {
         let options =
             self.permission_options_for_tool_call(&session_id, tool_call_id.clone(), cx)?;
         let outcome = resolve_outcome_from_selection(options, selection, is_allow)?;
-        self.authorize_tool_call(session_id, tool_call_id, outcome, cx);
+        self.authorize_tool_call(session_id, tool_call_id, outcome, edited_command, cx);
         Some(())
     }
 
@@ -423,6 +426,7 @@ impl Conversation {
         session_id: acp::SessionId,
         tool_call_id: acp::ToolCallId,
         outcome: SelectedPermissionOutcome,
+        edited_command: Option<String>,
         cx: &mut Context<Self>,
     ) {
         let Some(thread) = self.threads.get(&session_id) else {
@@ -439,7 +443,7 @@ impl Conversation {
         );
 
         thread.update(cx, |thread, cx| {
-            thread.authorize_tool_call(tool_call_id, outcome, cx);
+            thread.authorize_tool_call(tool_call_id, outcome, edited_command, cx);
         });
         cx.notify();
     }
@@ -9077,6 +9081,7 @@ pub(crate) mod tests {
                         acp::PermissionOptionId::new("allow-1"),
                         acp::PermissionOptionKind::AllowOnce,
                     ),
+                    None,
                     cx,
                 );
             });
@@ -9101,6 +9106,7 @@ pub(crate) mod tests {
                         acp::PermissionOptionId::new("allow-2"),
                         acp::PermissionOptionKind::AllowOnce,
                     ),
+                    None,
                     cx,
                 );
             });
@@ -9240,6 +9246,7 @@ pub(crate) mod tests {
                         acp::PermissionOptionId::new("allow-a"),
                         acp::PermissionOptionKind::AllowOnce,
                     ),
+                    None,
                     cx,
                 );
             });

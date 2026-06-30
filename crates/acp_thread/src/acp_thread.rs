@@ -820,6 +820,12 @@ pub struct SelectedPermissionOutcome {
     pub option_id: acp::PermissionOptionId,
     pub option_kind: acp::PermissionOptionKind,
     pub params: Option<SelectedPermissionParams>,
+    /// When the user edited a terminal command in the approval card before
+    /// allowing it, the edited command to run. It is carried to the agent on
+    /// the wire as the selected outcome's `_meta.updatedCommand` (see the
+    /// `From` impl below), so the agent can run the edit instead of the
+    /// command it originally proposed.
+    pub edited_command: Option<String>,
 }
 
 impl SelectedPermissionOutcome {
@@ -828,6 +834,7 @@ impl SelectedPermissionOutcome {
             option_id,
             option_kind,
             params: None,
+            edited_command: None,
         }
     }
 
@@ -835,11 +842,22 @@ impl SelectedPermissionOutcome {
         self.params = params;
         self
     }
+
+    pub fn edited_command(mut self, edited_command: Option<String>) -> Self {
+        self.edited_command = edited_command;
+        self
+    }
 }
 
 impl From<SelectedPermissionOutcome> for acp::SelectedPermissionOutcome {
     fn from(value: SelectedPermissionOutcome) -> Self {
-        Self::new(value.option_id)
+        let mut outcome = Self::new(value.option_id);
+        if let Some(edited_command) = value.edited_command {
+            let mut meta = acp::Meta::new();
+            meta.insert("updatedCommand".into(), edited_command.into());
+            outcome = outcome.meta(meta);
+        }
+        outcome
     }
 }
 
@@ -2656,7 +2674,8 @@ impl AcpThread {
     pub fn authorize_tool_call(
         &mut self,
         id: acp::ToolCallId,
-        outcome: SelectedPermissionOutcome,
+        mut outcome: SelectedPermissionOutcome,
+        edited_command: Option<String>,
         cx: &mut Context<Self>,
     ) {
         let Some((ix, call)) = self.tool_call_mut(&id) else {
@@ -2690,6 +2709,8 @@ impl AcpThread {
             };
 
         let curr_status = mem::replace(&mut call.status, new_status);
+
+        outcome.edited_command = edited_command;
 
         if let ToolCallStatus::WaitingForConfirmation { respond_tx, .. } = curr_status {
             respond_tx.send(outcome).ok();
@@ -4922,7 +4943,7 @@ mod tests {
             acp::PermissionOptionKind::AllowOnce,
         );
         thread.update(cx, |thread, cx| {
-            thread.authorize_tool_call(tool_call_id.clone(), selected_outcome, cx);
+            thread.authorize_tool_call(tool_call_id.clone(), selected_outcome, None, cx);
         });
 
         thread.read_with(cx, |thread, _cx| {
@@ -5033,6 +5054,7 @@ mod tests {
                     acp::PermissionOptionId::new("allow"),
                     acp::PermissionOptionKind::AllowOnce,
                 ),
+                None,
                 cx,
             );
         });
@@ -5124,6 +5146,7 @@ mod tests {
                     acp::PermissionOptionId::new("allow"),
                     acp::PermissionOptionKind::AllowOnce,
                 ),
+                None,
                 cx,
             );
         });
