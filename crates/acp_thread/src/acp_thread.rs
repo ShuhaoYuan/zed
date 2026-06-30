@@ -1215,6 +1215,12 @@ pub struct SelectedPermissionOutcome {
     /// the agent via `_meta` so it can be surfaced to the model. Only meaningful
     /// for rejections by external ACP agents.
     pub reason: Option<String>,
+    /// When the user edited a terminal command in the approval card before
+    /// allowing it, the edited command to run. It is carried to the agent on
+    /// the wire as the selected outcome's `_meta.updatedCommand` (see the
+    /// `From` impl below), so the agent can run the edit instead of the
+    /// command it originally proposed.
+    pub edited_command: Option<String>,
 }
 
 impl SelectedPermissionOutcome {
@@ -1224,6 +1230,7 @@ impl SelectedPermissionOutcome {
             option_kind,
             params: None,
             reason: None,
+            edited_command: None,
         }
     }
 
@@ -1236,14 +1243,23 @@ impl SelectedPermissionOutcome {
         self.reason = reason;
         self
     }
+
+    pub fn edited_command(mut self, edited_command: Option<String>) -> Self {
+        self.edited_command = edited_command;
+        self
+    }
 }
 
 impl From<SelectedPermissionOutcome> for acp::SelectedPermissionOutcome {
     fn from(value: SelectedPermissionOutcome) -> Self {
-        let meta = value.reason.map(|reason| {
-            acp::Meta::from_iter([(REJECTION_REASON_META_KEY.into(), reason.into())])
-        });
-        acp::SelectedPermissionOutcome::new(value.option_id).meta(meta)
+        let mut meta = acp::Meta::new();
+        if let Some(reason) = value.reason {
+            meta.insert(REJECTION_REASON_META_KEY.into(), reason.into());
+        }
+        if let Some(edited_command) = value.edited_command {
+            meta.insert("updatedCommand".into(), edited_command.into());
+        }
+        Self::new(value.option_id).meta((!meta.is_empty()).then_some(meta))
     }
 }
 

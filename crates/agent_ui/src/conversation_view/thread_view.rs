@@ -620,6 +620,12 @@ pub struct ThreadView {
     /// external ACP agents. The text is forwarded via the permission
     /// outcome's `_meta` so the agent can surface it to its model.
     pub(crate) rejection_reason_editors: HashMap<acp::ToolCallId, Entity<Editor>>,
+    /// Editable single-line editors holding user-modified terminal commands,
+    /// keyed by the tool call awaiting confirmation. Only present for terminal
+    /// tool calls in `WaitingForConfirmation`; created lazily by
+    /// [`Self::ensure_command_editors`] during render so the field is always
+    /// seeded with the agent's proposed command.
+    pub(crate) command_editors: HashMap<acp::ToolCallId, Entity<Editor>>,
     pub _cancel_task: Option<Task<()>>,
     _save_task: Option<Task<()>>,
     _draft_resolve_task: Option<Task<()>>,
@@ -1055,6 +1061,7 @@ impl ThreadView {
             permission_selections: HashMap::default(),
             elicitation_form_states: HashMap::default(),
             rejection_reason_editors: HashMap::default(),
+            command_editors: HashMap::default(),
             _cancel_task: None,
             _save_task: None,
             _draft_resolve_task: None,
@@ -2602,6 +2609,91 @@ impl ThreadView {
         cx.notify();
     }
 
+    /// Extracts the plain command text from a tool call's markdown label,
+    /// mirroring the fence-stripping in `render_collapsible_command`.
+    fn command_text_from_markdown(label: &Entity<Markdown>, cx: &App) -> String {
+        let source = label.read(cx).source();
+        source
+            .strip_prefix("```\n")
+            .and_then(|s| s.strip_suffix("\n```"))
+            .unwrap_or(&source)
+            .to_string()
+    }
+
+    /// Ensures an editable command editor exists for every terminal tool call
+    /// currently awaiting confirmation (seeded with the proposed command) and
+    /// drops editors for tool calls that have left that state. Editors need a
+    /// `Window` to construct, so this runs from `render` (which has one) rather
+    /// than from the `&self`/`&Window` render helpers.
+    fn ensure_command_editors(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let awaiting: Vec<(acp::ToolCallId, String)> = {
+            let thread = self.thread.read(cx);
+            thread
+                .entries()
+                .iter()
+                .filter_map(|entry| match entry {
+                    AgentThreadEntry::ToolCall(tool_call) => {
+                        let is_terminal = matches!(tool_call.kind, acp::ToolKind::Execute);
+                        let is_awaiting = matches!(
+                            tool_call.status,
+                            ToolCallStatus::WaitingForConfirmation { .. }
+                        );
+                        if is_terminal && is_awaiting {
+                            Some((
+                                tool_call.id.clone(),
+                                Self::command_text_from_markdown(&tool_call.label, cx),
+                            ))
+                        } else {
+                            None
+                        }
+                    }
+                    _ => None,
+                })
+                .collect()
+        };
+
+        for (id, original) in &awaiting {
+            if !self.command_editors.contains_key(id) {
+                let original = original.clone();
+                let editor = cx.new(|cx| {
+                    let mut editor = Editor::single_line(window, cx);
+                    editor.set_text(original, window, cx);
+                    editor
+                });
+                self.command_editors.insert(id.clone(), editor);
+            }
+        }
+        self.command_editors
+            .retain(|id, _| awaiting.iter().any(|(awaiting_id, _)| awaiting_id == id));
+    }
+
+    /// Removes the editor for a tool call and returns the edited command, but
+    /// only when the user is allowing the call and the text differs from the
+    /// proposed command. Returns `None` (after clearing the editor) on reject
+    /// or when the command was left unchanged, so the agent runs its original.
+    fn take_edited_command(
+        &mut self,
+        tool_call_id: &acp::ToolCallId,
+        is_allow: bool,
+        cx: &mut Context<Self>,
+    ) -> Option<String> {
+        let editor = self.command_editors.remove(tool_call_id)?;
+        if !is_allow {
+            return None;
+        }
+        let edited = editor.read(cx).text(cx).trim().to_string();
+        if edited.is_empty() {
+            return None;
+        }
+        let original = self
+            .thread
+            .read(cx)
+            .tool_call(tool_call_id)
+            .map(|(_, tool_call)| Self::command_text_from_markdown(&tool_call.label, cx))
+            .unwrap_or_default();
+        (edited != original).then_some(edited)
+    }
+
     pub fn authorize_tool_call(
         &mut self,
         session_id: acp::SessionId,
@@ -2610,7 +2702,13 @@ impl ThreadView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        let is_allow = matches!(
+            outcome.option_kind,
+            acp::PermissionOptionKind::AllowOnce | acp::PermissionOptionKind::AllowAlways
+        );
         let outcome = self.with_rejection_reason(outcome, &tool_call_id, cx);
+        let edited_command = self.take_edited_command(&tool_call_id, is_allow, cx);
+        let outcome = outcome.edited_command(edited_command);
         self.conversation.update(cx, |conversation, cx| {
             conversation.authorize_tool_call(session_id, tool_call_id, outcome, cx);
         });
@@ -2670,8 +2768,20 @@ impl ThreadView {
         cx: &mut Context<Self>,
     ) -> Option<()> {
         let session_id = self.thread.read(cx).session_id().clone();
+        let pending_id = self
+            .conversation
+            .read(cx)
+            .pending_tool_call(&session_id, cx)
+            .map(|(_, id, _)| id);
+        let is_allow = matches!(
+            kind,
+            acp::PermissionOptionKind::AllowOnce | acp::PermissionOptionKind::AllowAlways
+        );
+        let edited_command = pending_id
+            .as_ref()
+            .and_then(|id| self.take_edited_command(id, is_allow, cx));
         self.conversation.update(cx, |conversation, cx| {
-            conversation.authorize_pending_tool_call(&session_id, kind, cx)
+            conversation.authorize_pending_tool_call(&session_id, kind, edited_command, cx)
         })?;
         if self.should_be_following {
             self.workspace
@@ -3005,6 +3115,7 @@ impl ThreadView {
         } else {
             None
         };
+        let edited_command = self.take_edited_command(&tool_call_id, is_allow, cx);
         let result = self.conversation.update(cx, |conversation, cx| {
             conversation.authorize_with_granularity(
                 session_id,
@@ -3012,6 +3123,7 @@ impl ThreadView {
                 selection.as_ref(),
                 is_allow,
                 reason,
+                edited_command,
                 cx,
             )
         });
@@ -8585,13 +8697,27 @@ impl ThreadView {
         let body = v_flex()
             .map(|this| {
                 if is_terminal_tool {
-                    this.child(self.render_collapsible_command(
-                        card_header_id.clone(),
-                        true,
-                        tool_call.label.clone(),
-                        window,
-                        cx,
-                    ))
+                    let this = if needs_confirmation {
+                        match self.command_editors.get(&tool_call.id).cloned() {
+                            Some(editor) => this.child(
+                                v_flex()
+                                    .w_full()
+                                    .p_1p5()
+                                    .bg(self.tool_card_header_bg(cx))
+                                    .child(editor),
+                            ),
+                            None => this,
+                        }
+                    } else {
+                        this.child(self.render_collapsible_command(
+                            card_header_id.clone(),
+                            true,
+                            tool_call.label.clone(),
+                            window,
+                            cx,
+                        ))
+                    };
+                    this
                 } else {
                     this.child(
                         h_flex()
@@ -12270,6 +12396,7 @@ impl Render for ThreadView {
         // current availability of feedback/sharing, which can change between
         // renders (settings, connection state, feature flags).
         self.sync_local_commands(cx);
+        self.ensure_command_editors(window, cx);
 
         let has_messages = self.list_state.item_count() > 0;
         let list_state = self.list_state.clone();

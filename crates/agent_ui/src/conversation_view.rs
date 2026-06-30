@@ -442,6 +442,7 @@ impl Conversation {
         &mut self,
         session_id: &acp::SessionId,
         kind: acp::PermissionOptionKind,
+        edited_command: Option<String>,
         cx: &mut Context<Self>,
     ) -> Option<()> {
         let (authorize_session_id, tool_call_id, options) =
@@ -450,7 +451,8 @@ impl Conversation {
         self.authorize_tool_call(
             authorize_session_id,
             tool_call_id,
-            SelectedPermissionOutcome::new(option.option_id.clone(), option.kind),
+            SelectedPermissionOutcome::new(option.option_id.clone(), option.kind)
+                .edited_command(edited_command),
             cx,
         );
         Some(())
@@ -463,11 +465,14 @@ impl Conversation {
         selection: Option<&thread_view::PermissionSelection>,
         is_allow: bool,
         reason: Option<String>,
+        edited_command: Option<String>,
         cx: &mut Context<Self>,
     ) -> Option<()> {
         let options =
             self.permission_options_for_tool_call(&session_id, tool_call_id.clone(), cx)?;
-        let outcome = resolve_outcome_from_selection(options, selection, is_allow)?.reason(reason);
+        let outcome = resolve_outcome_from_selection(options, selection, is_allow)?
+            .reason(reason)
+            .edited_command(edited_command);
         self.authorize_tool_call(session_id, tool_call_id, outcome, cx);
         Some(())
     }
