@@ -7122,13 +7122,34 @@ impl ThreadView {
             .map(|path| path.display().to_string())
             .unwrap_or_else(|| "current directory".to_string());
 
-        let command_element = self.render_collapsible_command(
-            header_group.clone(),
-            false,
-            tool_call.label.clone(),
-            window,
-            cx,
-        );
+        // When awaiting confirmation, replace the read-only command preview
+        // with an editable field so the user can tweak the command before
+        // approving it. The editor is created up-front by
+        // `ensure_command_editors` (run from `render`), keyed by tool call id.
+        let command_element = if needs_confirmation {
+            match self.command_editors.get(&tool_call.id).cloned() {
+                Some(editor) => v_flex()
+                    .w_full()
+                    .p_1p5()
+                    .bg(self.tool_card_header_bg(cx))
+                    .child(editor),
+                None => self.render_collapsible_command(
+                    header_group.clone(),
+                    false,
+                    tool_call.label.clone(),
+                    window,
+                    cx,
+                ),
+            }
+        } else {
+            self.render_collapsible_command(
+                header_group.clone(),
+                false,
+                tool_call.label.clone(),
+                window,
+                cx,
+            )
+        };
 
         let is_expanded = self
             .entry_view_state
