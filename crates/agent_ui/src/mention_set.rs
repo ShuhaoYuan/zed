@@ -391,50 +391,81 @@ impl MentionSet {
             return Task::ready(Err(anyhow!("project not found")));
         };
 
-        let Some(project_path) = project
+        let project_path = project
             .read(cx)
-            .project_path_for_absolute_path(&abs_path, cx)
-        else {
-            return Task::ready(Err(anyhow!("project path not found")));
-        };
+            .project_path_for_absolute_path(&abs_path, cx);
 
         if is_raster_image_path(&abs_path) {
             if !supports_images {
                 return Task::ready(Err(anyhow!("This model does not support images yet")));
             }
-            let task = project.update(cx, |project, cx| project.open_image(project_path, cx));
-            return cx.spawn(async move |_, cx| {
-                let image = task.await?;
-                let image = image.update(cx, |image, _| image.image.clone());
-                let image = cx
-                    .update(|cx| LanguageModelImage::from_image(image, cx))
-                    .await;
-                if let Some(image) = image {
-                    Ok(Mention::Image(MentionImage {
-                        data: image.source,
-                        format: LanguageModelImage::FORMAT,
-                    }))
-                } else {
-                    Err(anyhow!("Failed to convert image"))
+            // Images inside a worktree are opened through the project (tracked).
+            // Images outside the project are read straight from disk.
+            return match project_path {
+                Some(project_path) => {
+                    let task =
+                        project.update(cx, |project, cx| project.open_image(project_path, cx));
+                    cx.spawn(async move |_, cx| {
+                        let image = task.await?;
+                        let image = image.update(cx, |image, _| image.image.clone());
+                        let image = cx
+                            .update(|cx| LanguageModelImage::from_image(image, cx))
+                            .await;
+                        Self::image_to_mention(image)
+                    })
                 }
-            });
+                None => cx.spawn(async move |_, cx| {
+                    let (image, _name) = load_external_image_from_path(&abs_path, &"Image".into())
+                        .ok_or_else(|| {
+                            anyhow!("Failed to read image {}", abs_path.display())
+                        })?;
+                    let image = Arc::new(image);
+                    let image = cx
+                        .update(|cx| LanguageModelImage::from_image(image, cx))
+                        .await;
+                    Self::image_to_mention(image)
+                }),
+            };
         }
 
-        let buffer = project.update(cx, |project, cx| project.open_buffer(project_path, cx));
-        cx.spawn(async move |_, cx| {
-            let buffer = buffer.await?;
-            let buffer_content = outline::get_buffer_content_or_outline(
-                buffer.clone(),
-                Some(&abs_path.to_string_lossy()),
-                &cx,
-            )
-            .await?;
+        match project_path {
+            Some(project_path) => {
+                let buffer =
+                    project.update(cx, |project, cx| project.open_buffer(project_path, cx));
+                cx.spawn(async move |_, cx| {
+                    let buffer = buffer.await?;
+                    let buffer_content = outline::get_buffer_content_or_outline(
+                        buffer.clone(),
+                        Some(&abs_path.to_string_lossy()),
+                        &cx,
+                    )
+                    .await?;
 
-            Ok(Mention::Text {
-                content: buffer_content.text,
-                tracked_buffers: vec![buffer],
-            })
-        })
+                    Ok(Mention::Text {
+                        content: buffer_content.text,
+                        tracked_buffers: vec![buffer],
+                    })
+                })
+            }
+            // A file that lives outside any worktree: read it straight from disk
+            // as a read-only snapshot (no tracked buffer), like skill files.
+            None => cx.background_spawn(async move {
+                let content = std::fs::read_to_string(&abs_path)
+                    .map_err(|e| anyhow!("Failed to read file {}: {}", abs_path.display(), e))?;
+                Ok(Mention::Text {
+                    content,
+                    tracked_buffers: Vec::new(),
+                })
+            }),
+        }
+    }
+
+    fn image_to_mention(image: Option<LanguageModelImage>) -> Result<Mention> {
+        let image = image.ok_or_else(|| anyhow!("Failed to convert image"))?;
+        Ok(Mention::Image(MentionImage {
+            data: image.source,
+            format: LanguageModelImage::FORMAT,
+        }))
     }
 
     fn confirm_mention_for_fetch(
@@ -1179,11 +1210,13 @@ fn full_mention_for_directory(
         files
     }
 
-    let Some(project_path) = project
+    let project_path = project
         .read(cx)
-        .project_path_for_absolute_path(&abs_path, cx)
-    else {
-        return Task::ready(Err(anyhow!("project path not found")));
+        .project_path_for_absolute_path(&abs_path, cx);
+    let Some(project_path) = project_path else {
+        // The directory lives outside every worktree: walk the filesystem
+        // directly and embed its files as a read-only snapshot.
+        return full_mention_for_external_directory(abs_path.to_path_buf(), cx);
     };
     let Some(entry) = project.read(cx).entry_for_path(&project_path, cx) else {
         return Task::ready(Err(anyhow!("project entry not found")));
@@ -1249,6 +1282,59 @@ fn full_mention_for_directory(
             })
             .await;
         anyhow::Ok(contents)
+    })
+}
+
+/// Like `full_mention_for_directory`, but for a directory that lives outside
+/// every worktree. Walks the filesystem directly (no tracked buffers) and embeds
+/// the readable text files as a read-only snapshot, matching how external file
+/// mentions behave. Bounded to avoid embedding arbitrarily large trees.
+fn full_mention_for_external_directory(abs_path: PathBuf, cx: &mut App) -> Task<Result<Mention>> {
+    const MAX_FILES: usize = 100;
+    const MAX_FILE_BYTES: u64 = 256 * 1024;
+
+    cx.background_spawn(async move {
+        let mut entries: Vec<(Arc<RelPath>, String, String)> = Vec::new();
+        let mut stack = vec![abs_path];
+
+        while let Some(directory) = stack.pop() {
+            let Ok(directory_entries) = std::fs::read_dir(&directory) else {
+                continue;
+            };
+            for entry in directory_entries.flatten() {
+                if entries.len() >= MAX_FILES {
+                    break;
+                }
+                let Ok(file_type) = entry.file_type() else {
+                    continue;
+                };
+                let path = entry.path();
+                if file_type.is_dir() {
+                    stack.push(path);
+                } else if file_type.is_file() {
+                    let Ok(metadata) = entry.metadata() else {
+                        continue;
+                    };
+                    if metadata.len() > MAX_FILE_BYTES {
+                        continue;
+                    }
+                    let Ok(content) = std::fs::read_to_string(&path) else {
+                        continue;
+                    };
+                    entries.push((
+                        RelPath::empty_arc(),
+                        path.to_string_lossy().into_owned(),
+                        content,
+                    ));
+                }
+            }
+        }
+
+        entries.sort_by(|a, b| a.1.cmp(&b.1));
+        Ok(Mention::Text {
+            content: render_directory_contents(entries),
+            tracked_buffers: Vec::new(),
+        })
     })
 }
 
