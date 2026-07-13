@@ -9,8 +9,8 @@ use agent_client_protocol::schema as acp;
 use std::cell::RefCell;
 
 use acp_thread::{
-    ContentBlock, PlanEntry, SandboxAuthorizationDetails, SandboxFallbackAuthorizationDetails,
-    SandboxNotAppliedReason,
+    AcpThreadEvent, ContentBlock, PlanEntry, SandboxAuthorizationDetails,
+    SandboxFallbackAuthorizationDetails, SandboxNotAppliedReason,
 };
 use agent::{SkillLoadingIssue, SkillLoadingIssueKind, SkillLoadingIssuesUpdated};
 use agent_settings::UserAgentsMd;
@@ -597,6 +597,10 @@ pub struct ThreadView {
     pub new_server_version_available: Option<SharedString>,
     pub resumed_without_history: bool,
     pub(crate) permission_selections: HashMap<acp::ToolCallId, PermissionSelection>,
+    /// Optional per-tool-call "rejection reason" inputs, shown only for
+    /// external ACP agents. The text is forwarded via the permission
+    /// outcome's `_meta` so the agent can surface it to its model.
+    pub(crate) rejection_reason_editors: HashMap<acp::ToolCallId, Entity<Editor>>,
     pub _cancel_task: Option<Task<()>>,
     _save_task: Option<Task<()>>,
     _draft_resolve_task: Option<Task<()>>,
@@ -869,6 +873,26 @@ impl ThreadView {
             Self::handle_message_editor_event,
         ));
 
+        // Manage the per-tool-call rejection-reason editors (external ACP agents
+        // only) for the lifetime of each permission prompt.
+        subscriptions.push(
+            cx.subscribe_in(
+                &thread,
+                window,
+                |this, _thread, event, window, cx| match event {
+                    AcpThreadEvent::ToolAuthorizationRequested(tool_call_id) => {
+                        if this.as_native_connection(cx).is_none() {
+                            this.ensure_rejection_reason_editor(tool_call_id.clone(), window, cx);
+                        }
+                    }
+                    AcpThreadEvent::ToolAuthorizationReceived(tool_call_id) => {
+                        this.rejection_reason_editors.remove(tool_call_id);
+                    }
+                    _ => {}
+                },
+            ),
+        );
+
         // If this thread is backed by a NativeAgent, listen for skill loading
         // issues so we can surface them as banners. The agent emits a single
         // replacement-style event per project refresh, so we overwrite our
@@ -977,6 +1001,7 @@ impl ThreadView {
             is_loading_contents: false,
             new_server_version_available: None,
             permission_selections: HashMap::default(),
+            rejection_reason_editors: HashMap::default(),
             _cancel_task: None,
             _save_task: None,
             _draft_resolve_task: None,
@@ -1102,6 +1127,72 @@ impl ThreadView {
         let acp_thread = self.thread.read(cx);
         self.as_native_connection(cx)?
             .thread(acp_thread.session_id(), cx)
+    }
+
+    /// Lazily creates the rejection-reason editor for a tool call awaiting
+    /// permission. Called when an external agent requests authorization; a
+    /// no-op if the editor already exists.
+    fn ensure_rejection_reason_editor(
+        &mut self,
+        tool_call_id: acp::ToolCallId,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.rejection_reason_editors.contains_key(&tool_call_id) {
+            return;
+        }
+        let editor = cx.new(|cx| {
+            let mut editor = Editor::single_line(window, cx);
+            editor.set_placeholder_text(
+                "Tell the agent why you're rejecting (optional)",
+                window,
+                cx,
+            );
+            editor
+        });
+        self.rejection_reason_editors.insert(tool_call_id, editor);
+        cx.notify();
+    }
+
+    /// Returns the rejection-reason editor for a tool call, if one exists.
+    pub(crate) fn rejection_reason_editor(
+        &self,
+        tool_call_id: &acp::ToolCallId,
+    ) -> Option<Entity<Editor>> {
+        self.rejection_reason_editors.get(tool_call_id).cloned()
+    }
+
+    /// Reads and trims the rejection reason for a tool call, if any.
+    fn rejection_reason(&self, tool_call_id: &acp::ToolCallId, cx: &App) -> Option<String> {
+        let editor = self.rejection_reason_editors.get(tool_call_id)?;
+        let text = editor.read(cx).text(cx);
+        let trimmed = text.trim();
+        if trimmed.is_empty() {
+            None
+        } else {
+            Some(trimmed.to_owned())
+        }
+    }
+
+    /// For an external ACP agent's rejection, attaches the user-typed reason
+    /// (if any) to the outcome so it travels to the agent via `_meta`. Other
+    /// cases pass the outcome through unchanged.
+    fn with_rejection_reason(
+        &self,
+        outcome: SelectedPermissionOutcome,
+        tool_call_id: &acp::ToolCallId,
+        cx: &App,
+    ) -> SelectedPermissionOutcome {
+        let is_external = self.as_native_connection(cx).is_none();
+        let is_rejection = matches!(
+            outcome.option_kind,
+            acp::PermissionOptionKind::RejectOnce | acp::PermissionOptionKind::RejectAlways
+        );
+        if is_external && is_rejection {
+            outcome.reason(self.rejection_reason(tool_call_id, cx))
+        } else {
+            outcome
+        }
     }
 
     /// Resolves the message editor's contents into content blocks. For profiles
@@ -2319,6 +2410,7 @@ impl ThreadView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        let outcome = self.with_rejection_reason(outcome, &tool_call_id, cx);
         self.conversation.update(cx, |conversation, cx| {
             conversation.authorize_tool_call(session_id, tool_call_id, outcome, cx);
         });
@@ -2489,12 +2581,18 @@ impl ThreadView {
         cx: &mut Context<Self>,
     ) -> Option<()> {
         let selection = self.permission_selections.get(&tool_call_id).cloned();
+        let reason = if !is_allow && self.as_native_connection(cx).is_none() {
+            self.rejection_reason(&tool_call_id, cx)
+        } else {
+            None
+        };
         let result = self.conversation.update(cx, |conversation, cx| {
             conversation.authorize_with_granularity(
                 session_id,
                 tool_call_id,
                 selection.as_ref(),
                 is_allow,
+                reason,
                 cx,
             )
         });
@@ -8355,13 +8453,13 @@ impl ThreadView {
         focus_handle: &FocusHandle,
         cx: &Context<Self>,
     ) -> Div {
-        match options {
+        let buttons = match options {
             PermissionOptions::Flat(options) => self.render_permission_buttons_flat(
                 session_id,
                 is_first,
                 options,
                 entry_ix,
-                tool_call_id,
+                tool_call_id.clone(),
                 focus_handle,
                 cx,
             ),
@@ -8371,7 +8469,7 @@ impl ThreadView {
                 None,
                 entry_ix,
                 session_id,
-                tool_call_id,
+                tool_call_id.clone(),
                 focus_handle,
                 cx,
             ),
@@ -8385,11 +8483,22 @@ impl ThreadView {
                 Some((patterns, tool_name)),
                 entry_ix,
                 session_id,
-                tool_call_id,
+                tool_call_id.clone(),
                 focus_handle,
                 cx,
             ),
-        }
+        };
+        // External ACP agents only: an optional rejection-reason input beneath
+        // the buttons. The text is forwarded via the permission outcome's
+        // `_meta` so the agent can surface it to its model on rejection.
+        let reason_editor = if self.as_native_connection(cx).is_none() {
+            self.rejection_reason_editor(&tool_call_id)
+        } else {
+            None
+        };
+        buttons.when_some(reason_editor, |this, editor| {
+            this.child(div().px_1().pb_1().child(editor))
+        })
     }
 
     fn render_permission_buttons_with_dropdown(

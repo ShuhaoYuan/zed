@@ -409,11 +409,12 @@ impl Conversation {
         tool_call_id: acp::ToolCallId,
         selection: Option<&thread_view::PermissionSelection>,
         is_allow: bool,
+        reason: Option<String>,
         cx: &mut Context<Self>,
     ) -> Option<()> {
         let options =
             self.permission_options_for_tool_call(&session_id, tool_call_id.clone(), cx)?;
-        let outcome = resolve_outcome_from_selection(options, selection, is_allow)?;
+        let outcome = resolve_outcome_from_selection(options, selection, is_allow)?.reason(reason);
         self.authorize_tool_call(session_id, tool_call_id, outcome, cx);
         Some(())
     }
