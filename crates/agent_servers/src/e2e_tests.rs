@@ -213,6 +213,7 @@ pub async fn test_tool_call_with_permission<T, F>(
                 allow_option_id,
                 acp::PermissionOptionKind::AllowOnce,
             ),
+            None,
             cx,
         );
 

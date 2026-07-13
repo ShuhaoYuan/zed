@@ -2213,7 +2213,7 @@ impl NativeAgentConnection {
                                 outcome,
                             } => {
                                 acp_thread.update(cx, |thread, cx| {
-                                    thread.authorize_tool_call(tool_call_id, outcome, cx);
+                                    thread.authorize_tool_call(tool_call_id, outcome, None, cx);
                                 })?;
                             }
                             ThreadEvent::ToolCall(tool_call) => {
