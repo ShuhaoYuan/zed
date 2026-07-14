@@ -242,6 +242,42 @@ llvm-objcopy --strip-debug target/x86_64-unknown-linux-musl/release/remote_serve
 
 If you do this, you must upload it to `~/.zed_server/zed-remote-server-{RELEASE_CHANNEL}-{VERSION}` on the server, for example `~/.zed_server/zed-remote-server-stable-0.217.3+stable.105.80433cb239e868271457ac376673a5f75bc4adb1`. The version must exactly match the version of Zed itself you are using.
 
+### Building a dev server binary from source
+
+When you run a local development build of Zed (`cargo run`, release channel `dev`), it looks for the server at `~/.zed_server/zed-remote-server-dev-build` on the remote host (the `dev` channel has no published binary to download). You have two ways to provide it.
+
+The simplest is to let Zed build and upload the server for you when you connect:
+
+```bash
+ZED_BUILD_REMOTE_SERVER=1 cargo run
+```
+
+This runs the same build described below and uploads the result automatically. Cross-compiling to a remote of a different architecture or OS additionally needs `rustup`, `zig`, and `cargo-zigbuild` on your `PATH`. To reuse a binary you already have instead of compiling, set `ZED_COPY_REMOTE_SERVER=/path/to/zed-remote-server`.
+
+To build the binary yourself and place it manually, use the same invocation Zed runs internally. The `debug-embed` feature is required so the server's assets are embedded in the binary:
+
+```bash
+RUSTFLAGS="-C target-feature=+crt-static" \
+cargo build \
+  --package remote_server \
+  --features debug-embed \
+  --target-dir target/remote_server \
+  --target x86_64-unknown-linux-musl
+```
+
+The binary lands at `target/remote_server/x86_64-unknown-linux-musl/debug/remote_server`. Add `--release` for an optimized build (the output path then uses `release/` instead of `debug/`). Copy it to the remote host:
+
+```bash
+ssh <host> 'mkdir -p ~/.zed_server'
+scp target/remote_server/x86_64-unknown-linux-musl/debug/remote_server \
+  <host>:~/.zed_server/zed-remote-server-dev-build
+ssh <host> 'chmod +x ~/.zed_server/zed-remote-server-dev-build'
+```
+
+The filename is always `zed-remote-server-dev-build` for a `dev` build, regardless of whether you compiled in debug or release mode; the suffix tracks the release channel, not the build profile. The `--target` and `--features debug-embed` flags are both required, and you must run from the workspace root so the pinned toolchain in `rust-toolchain.toml` is used.
+
+> **Warn:** A `--release` build runs ThinLTO, whose final codegen step needs a lot of memory (several GB per parallel unit). On a low-memory machine it can swap-thrash for a very long time or be killed by the OOM killer (`signal: 9`). If a release build fails or stalls, build with `--profile release-fast` (skips LTO, near-identical runtime performance) or lower the peak memory with `-j 2`.
+
 ## Maintaining the SSH connection
 
 Once the server is initialized. Zed will create new SSH connections (reusing the existing ControlMaster) to run the remote development server.

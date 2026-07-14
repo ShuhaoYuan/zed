@@ -191,6 +191,32 @@ This can be done by Zed staff.
 
 ## Troubleshooting
 
+### `webrtc-sys` fails with `changes meaning of 'Network'` (`-fpermissive`)
+
+On systems with older GCC (for example GCC 11.4 on Ubuntu 22.04), the release
+build of `webrtc-sys` (the native WebRTC bindings used by the call/collaboration
+stack) fails with an error like:
+
+```bash
+error: declaration of 'virtual const webrtc::Network* webrtc::PortInterface::Network() const' changes meaning of 'Network' [-fpermissive]
+```
+
+> **_Note_**: The WebRTC headers reuse the name `Network` for both a class and a
+> method. The `webrtc-sys` build script tries to silence this with
+> `-Wno-changes-meaning`, but that flag only exists in GCC 15 and newer, so older
+> toolchains still emit the error.
+
+> **_Workaround_**: downgrade the diagnostic to a warning by exporting
+> `CXXFLAGS` before building:
+
+```sh
+CXXFLAGS="-fpermissive" cargo build --release
+```
+
+This only affects release builds (and `./script/clippy`); debug builds
+(`cargo run`) are unaffected because `webrtc-sys` is only compiled in release
+configurations on this toolchain.
+
 ### Cargo errors claiming that a dependency is using unstable features
 
 Try `cargo clean` and `cargo build`.

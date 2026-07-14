@@ -419,8 +419,8 @@ impl Conversation {
             self.permission_options_for_tool_call(&session_id, tool_call_id.clone(), cx)?;
         let outcome = resolve_outcome_from_selection(options, selection, is_allow)?
             .reason(reason)
-            .edited_command(edited_command);
-        self.authorize_tool_call(session_id, tool_call_id, outcome, None, cx);
+            .edited_command(edited_command.clone());
+        self.authorize_tool_call(session_id, tool_call_id, outcome, edited_command, cx);
         Some(())
     }
 

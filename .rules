@@ -1,3 +1,9 @@
+# About this project
+
+Zed is a high-performance, multiplayer code editor written in Rust by the creators of Atom and Tree-sitter. It runs on macOS, Linux, and Windows, and is built on its own GPU-accelerated UI framework, GPUI. The repository is a single Cargo workspace (Rust edition 2024) of ~235 crates under `crates/`, plus `extensions/` and `tooling/`.
+
+The toolchain is pinned in `rust-toolchain.toml`; build with that version rather than an ad-hoc `rustup` default.
+
 # Rust coding guidelines
 
 * Prioritize code correctness and clarity. Speed and efficiency are secondary priorities unless otherwise specified.
@@ -25,6 +31,18 @@
       }
   });
   ```
+
+# Workspace orientation
+
+Zed is a single Cargo workspace of ~235 crates under `crates/` (plus `extensions/` and `tooling/`). The default workspace member — what `cargo run` builds — is `crates/zed`, the application entry point. `crates/cli` is the launcher binary installed on the user's PATH as `zed`.
+
+For architecture, read the curated docs rather than reconstructing from memory (they are kept up to date; crate-level descriptions here are intentionally not duplicated):
+
+- `CONTRIBUTING.md` "Bird's-eye view of Zed" — the key crates: `gpui`, `editor`, `project`, `workspace`, `vim`, `lsp`, `language`, `collab`, `rpc`, `theme`, `ui`, `cli`, `zed`.
+- `docs/src/development/glossary.md` — terms and structures (`App`/`Context`, `Entity`/`View`, `Pane`/`Panel`/`Dock`, `Worktree`/`Project`, `MultiBuffer`, the debugger stores).
+- `docs/src/development/{macos,linux,windows}.md` — platform-specific build and setup notes.
+
+The root-level GPUI documentation below is the authoritative reference for the framework.
 
 # Timers in tests
 
@@ -131,9 +149,32 @@ While updating an entity (`cx: Context<T>`), it can emit an event using `cx.emit
 
 Other entities can then register a callback to handle these events by doing `cx.subscribe(other_entity, |this, other_entity, event, cx| ...)`. This will return a `Subscription` which deregisters the callback when dropped.  Typically `cx.subscribe` happens when creating a new entity and the subscriptions are stored in a `_subscriptions: Vec<Subscription>` field.
 
-## Build guidelines
+## Common commands
 
-- Use `./script/clippy` instead of `cargo clippy`
+Build and run (the default workspace member is `crates/zed`):
+
+- `cargo run` — build and run the editor (debug).
+- `cargo run -p cli` — run the CLI launcher (`crates/cli`); it is the primary UI in release mode.
+
+Tests:
+
+- `cargo test --workspace` — all tests.
+- `cargo test -p <crate>` — tests for one crate.
+- `cargo test -p <crate> <test_name>` — a single test.
+
+Lint and format:
+
+- `./script/clippy` — runs `cargo clippy --release --all-targets --all-features -- --deny warnings` across the workspace, then `cargo-machete`, `typos`, and `buf` if those tools are installed. Scope to one crate with `./script/clippy -p <crate>`. Prefer this over `cargo clippy`.
+- Clippy enforces `clippy.toml` `disallowed-methods`: spawn processes with `smol::process::Command` (not `std::process::Command`), and use `gpui::BackgroundExecutor::timer` over `smol::Timer::after`.
+- `cargo fmt` / `cargo fmt -- --check` (config in `rustfmt.toml`; edition 2024).
+
+Build profiles (defined in `Cargo.toml`): `--profile release-fast` skips LTO for faster iteration; `--profile dbg` is `dev` with full debug info.
+
+Other entry points:
+
+- `cargo xtask <command>` — repo build/release automation (e.g. `compliance`, `licenses`, `package-conformity`, `workflows`, `web-examples`). Subcommands live in `tooling/xtask/src/tasks/`.
+- `./script/new-crate <name> [apache]` — scaffold a crate under `crates/` (GPL-3.0-or-later by default, or Apache-2.0). Remember to add it to the workspace `members` list in `Cargo.toml`.
+- `./script/check-licenses` / `./script/generate-licenses` — CI requires every dependency to declare an accepted license (see `script/licenses/zed-licenses.toml`); new first-party crates need `publish = false` under `[package]`.
 
 # Pull request hygiene
 
@@ -161,7 +202,7 @@ Release Notes:
 - Crash investigation prompts: `.factory/prompts/crash/investigate.md`
 - Crash fix prompts: `.factory/prompts/crash/fix.md`
 - Fetch crash reports: `script/sentry-fetch <issue-id>`
-- Generate investigation prompt from crash: `script/crash-to-prompt <issue-id>`
+- Select crash candidates to investigate: `script/select-sentry-crash-candidates`
 
 # Rules Hygiene
 
