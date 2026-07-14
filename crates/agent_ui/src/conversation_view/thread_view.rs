@@ -9719,7 +9719,17 @@ impl ThreadView {
             None
         };
         buttons.when_some(reason_editor, |this, editor| {
-            this.child(div().px_1().pb_1().child(editor))
+            this.child(
+                div()
+                    .px_1()
+                    .pb_1()
+                    .capture_action(cx.listener(
+                        move |this, _: &editor::actions::Newline, window, cx| {
+                            this.reject_once(&RejectOnce, window, cx);
+                        },
+                    ))
+                    .child(editor),
+            )
         })
     }
 
