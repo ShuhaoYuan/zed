@@ -8125,6 +8125,10 @@ impl ThreadView {
             })
             .unwrap_or_else(|| (false, false, focus_handle.clone()));
 
+        let revealed_diff = has_revealed_diff
+            .then(|| tool_call.diffs().next().cloned())
+            .flatten();
+
         let use_card_layout = needs_confirmation || is_edit || is_terminal_tool;
 
         let has_image_content = tool_call.content.iter().any(|c| c.image().is_some());
@@ -8543,6 +8547,28 @@ impl ThreadView {
                                                         cx,
                                                     )
                                                 }),
+                                        )
+                                    })
+                                    .when_some(revealed_diff, |this, diff| {
+                                        let full_file_expanded = diff.read(cx).full_file_expanded();
+                                        let (icon, tooltip) = if full_file_expanded {
+                                            (IconName::ChevronDownUp, "Show Changes Only")
+                                        } else {
+                                            (IconName::ChevronUpDown, "Show Full File")
+                                        };
+                                        this.child(
+                                            IconButton::new(("diff-toggle-full-file", entry_ix), icon)
+                                                .icon_size(IconSize::Small)
+                                                .tooltip(Tooltip::text(tooltip))
+                                                .on_click(cx.listener(move |_, _, _, cx| {
+                                                    diff.update(cx, |diff, cx| {
+                                                        diff.set_full_file_expanded(
+                                                            !diff.full_file_expanded(),
+                                                            cx,
+                                                        );
+                                                    });
+                                                    cx.notify();
+                                                })),
                                         )
                                     }),
                             )

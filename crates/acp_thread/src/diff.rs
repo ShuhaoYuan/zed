@@ -80,6 +80,7 @@ impl Diff {
             path,
             base_text,
             new_buffer,
+            full_file_expanded: false,
             _update_diff: task,
         })
     }
@@ -117,6 +118,61 @@ impl Diff {
         if let Self::Pending(diff) = self {
             diff.reveal_range(range, cx);
         }
+    }
+
+    /// Whether this diff is rendered as the full file (whole buffer) rather than just the changed
+    /// hunks. Only `Finalized` diffs support this; `Pending` always reports `false`.
+    pub fn full_file_expanded(&self) -> bool {
+        match self {
+            Self::Finalized(diff) => diff.full_file_expanded,
+            Self::Pending(_) => false,
+        }
+    }
+
+    /// Toggles between showing the whole file and showing just the changed hunks by swapping the
+    /// multibuffer's excerpt ranges. No-op for `Pending` diffs; inline tool-call diffs are
+    /// `Finalized`.
+    pub fn set_full_file_expanded(&mut self, full_file_expanded: bool, cx: &mut Context<Self>) {
+        let Self::Finalized(diff) = self else {
+            return;
+        };
+        if diff.full_file_expanded == full_file_expanded {
+            return;
+        }
+        diff.full_file_expanded = full_file_expanded;
+
+        let multibuffer = diff.multibuffer.clone();
+        let buffer = diff.new_buffer.clone();
+
+        let ranges = {
+            let buffer = buffer.read(cx);
+            if full_file_expanded {
+                vec![Point::zero()..buffer.max_point()]
+            } else {
+                multibuffer
+                    .read(cx)
+                    .snapshot(cx)
+                    .diff_hunks()
+                    .map(|hunk| hunk.buffer_range.to_point(buffer))
+                    .collect::<Vec<_>>()
+            }
+        };
+        let context_line_count = if full_file_expanded {
+            0
+        } else {
+            excerpt_context_lines(cx)
+        };
+
+        multibuffer.update(cx, |multibuffer, cx| {
+            multibuffer.set_excerpts_for_path(
+                PathKey::for_buffer(&buffer, cx),
+                buffer,
+                ranges,
+                context_line_count,
+                cx,
+            );
+        });
+        cx.notify();
     }
 
     pub fn finalize(&mut self, cx: &mut Context<Self>) {
@@ -311,6 +367,7 @@ impl PendingDiff {
             base_text: self.base_text.clone(),
             multibuffer: self.multibuffer.clone(),
             new_buffer: self.new_buffer.clone(),
+            full_file_expanded: false,
             _update_diff: update_diff,
         }
     }
@@ -375,6 +432,7 @@ pub struct FinalizedDiff {
     base_text: Arc<str>,
     new_buffer: Entity<Buffer>,
     multibuffer: Entity<MultiBuffer>,
+    full_file_expanded: bool,
     _update_diff: Task<Result<()>>,
 }
 

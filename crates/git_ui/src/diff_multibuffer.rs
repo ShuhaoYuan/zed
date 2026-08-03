@@ -16,7 +16,7 @@ use gpui::{
     App, AppContext as _, AsyncWindowContext, Entity, EventEmitter, FocusHandle, Focusable, Render,
     SharedString, Subscription, Task, WeakEntity,
 };
-use language::{Anchor, Buffer, BufferId, Capability, OffsetRangeExt};
+use language::{Anchor, Buffer, BufferId, Capability, OffsetRangeExt, Point};
 use multi_buffer::{MultiBuffer, PathKey};
 use project::{
     ConflictSet, Project, ProjectPath,
@@ -26,7 +26,7 @@ use project::{
     },
 };
 use settings::{GitPanelGroupBy, GitPanelSortBy, Settings, SettingsStore};
-use std::{collections::BTreeMap, sync::Arc};
+use std::{collections::BTreeMap, ops::Range, sync::Arc};
 use theme::ActiveTheme;
 use ui::{CommonAnimationExt as _, KeyBinding, prelude::*};
 use util::{ResultExt as _, rel_path::RelPath};
@@ -39,6 +39,7 @@ use ztracing::instrument;
 struct BufferSubscriptions {
     _diff: Entity<BufferDiff>,
     display_buffer: Entity<Buffer>,
+    path_key: PathKey,
     _diff_subscription: Subscription,
     _conflict_set: Option<Entity<ConflictSet>>,
     _conflict_set_subscription: Option<Subscription>,
@@ -49,6 +50,7 @@ pub struct DiffMultibuffer {
     branch_diff: Entity<diff_buffer_list::DiffBufferList>,
     editor: Entity<SplittableEditor>,
     buffer_subscriptions: HashMap<RepoPath, BufferSubscriptions>,
+    full_file_paths: HashSet<PathKey>,
     workspace: WeakEntity<Workspace>,
     focus_handle: FocusHandle,
     pending_scroll: Option<PathKey>,
@@ -163,6 +165,7 @@ impl DiffMultibuffer {
             editor,
             multibuffer,
             buffer_subscriptions: Default::default(),
+            full_file_paths: Default::default(),
             pending_scroll: None,
             review_comment_count: 0,
             empty_label: empty_label.into(),
@@ -494,6 +497,7 @@ impl DiffMultibuffer {
             BufferSubscriptions {
                 _diff: diff.clone(),
                 display_buffer: display_buffer.clone(),
+                path_key: path_key.clone(),
                 _diff_subscription: diff_subscription,
                 _conflict_set: conflict_set.clone(),
                 _conflict_set_subscription: conflict_set_subscription,
@@ -501,26 +505,19 @@ impl DiffMultibuffer {
         );
 
         let snapshot = display_buffer.read(cx).snapshot();
-        let diff_snapshot = diff.read(cx).snapshot(cx);
 
-        let excerpt_ranges = {
-            let diff_hunk_ranges = diff_snapshot
-                .hunks_intersecting_range(
-                    Anchor::min_max_range_for_buffer(snapshot.remote_id()),
-                    &snapshot,
-                )
-                .map(|diff_hunk| diff_hunk.buffer_range.to_point(&snapshot));
-            let conflict_ranges = conflict_set.as_ref().and_then(|conflict_set| {
-                let conflicts = conflict_set.read(cx).snapshot();
-                let conflicts = conflicts
-                    .conflicts
-                    .iter()
-                    .map(|conflict| conflict.range.to_point(&snapshot))
-                    .collect::<Vec<_>>();
-                (!conflicts.is_empty()).then_some(conflicts)
-            });
-
-            conflict_ranges.unwrap_or_else(|| diff_hunk_ranges.collect())
+        let showing_full_file = self.full_file_paths.contains(&path_key);
+        let excerpt_ranges = Self::excerpt_ranges_for(
+            &display_buffer,
+            &diff,
+            conflict_set.as_ref(),
+            showing_full_file,
+            cx,
+        );
+        let context_line_count = if showing_full_file {
+            0
+        } else {
+            multibuffer_context_lines(cx)
         };
 
         let buffer_id = snapshot.text.remote_id();
@@ -532,7 +529,7 @@ impl DiffMultibuffer {
                 path_key.clone(),
                 display_buffer,
                 excerpt_ranges,
-                multibuffer_context_lines(cx),
+                context_line_count,
                 diff,
                 cx,
             );
@@ -731,6 +728,120 @@ impl DiffMultibuffer {
             worktree_id: file.worktree_id(cx),
             path: file.path().clone(),
         })
+    }
+
+    /// Computes the excerpt ranges for a buffer. When `showing_full_file` is true the whole buffer
+    /// is a single excerpt; otherwise the ranges are the diff hunks (or, if present, the merge
+    /// conflict ranges, which take precedence — matching `register_buffer`'s original behavior).
+    fn excerpt_ranges_for(
+        buffer: &Entity<Buffer>,
+        diff: &Entity<BufferDiff>,
+        conflict_set: Option<&Entity<ConflictSet>>,
+        showing_full_file: bool,
+        cx: &App,
+    ) -> Vec<Range<Point>> {
+        let snapshot = buffer.read(cx).snapshot();
+        if showing_full_file {
+            return vec![Point::zero()..snapshot.max_point()];
+        }
+        let diff_snapshot = diff.read(cx).snapshot(cx);
+        let diff_hunk_ranges = diff_snapshot
+            .hunks_intersecting_range(
+                Anchor::min_max_range_for_buffer(snapshot.remote_id()),
+                &snapshot,
+            )
+            .map(|diff_hunk| diff_hunk.buffer_range.to_point(&snapshot));
+        if let Some(conflict_set) = conflict_set {
+            let conflicts = conflict_set.read(cx).snapshot();
+            let conflict_ranges = conflicts
+                .conflicts
+                .iter()
+                .map(|conflict| conflict.range.to_point(&snapshot))
+                .collect::<Vec<_>>();
+            if !conflict_ranges.is_empty() {
+                return conflict_ranges;
+            }
+        }
+        diff_hunk_ranges.collect()
+    }
+
+    /// Returns the [`PathKey`] of the excerpt the cursor currently sits in, if any.
+    pub(crate) fn active_path_key(&self, cx: &App) -> Option<PathKey> {
+        let editor = self.editor.read(cx).focused_editor().read(cx);
+        let multibuffer = editor.buffer().read(cx);
+        let position = editor.selections.newest_anchor().head();
+        let snapshot = multibuffer.snapshot(cx);
+        let (text_anchor, _) = snapshot.anchor_to_buffer_anchor(position)?;
+        let active_buffer_id = text_anchor.buffer_id;
+        self.buffer_subscriptions
+            .iter()
+            .find(|(_, subscription)| {
+                subscription.display_buffer.read(cx).remote_id() == active_buffer_id
+            })
+            .map(|(_, subscription)| subscription.path_key.clone())
+    }
+
+    pub(crate) fn showing_full_file_for_active(&self, cx: &App) -> bool {
+        self.active_path_key(cx)
+            .is_some_and(|path_key| self.full_file_paths.contains(&path_key))
+    }
+
+    pub(crate) fn toggle_showing_full_file_for_active(&mut self, cx: &mut Context<Self>) {
+        let Some(path_key) = self.active_path_key(cx) else {
+            return;
+        };
+        let showing_full_file = !self.full_file_paths.contains(&path_key);
+        self.set_showing_full_file(path_key, showing_full_file, cx);
+    }
+
+    /// Toggles whether the given file is shown in full (whole buffer) or as hunks only. Re-lays
+    /// out just that file's excerpts, so other files in the multi-file diff are unaffected.
+    pub(crate) fn set_showing_full_file(
+        &mut self,
+        path_key: PathKey,
+        showing_full_file: bool,
+        cx: &mut Context<Self>,
+    ) {
+        let already_full_file = self.full_file_paths.contains(&path_key);
+        if already_full_file == showing_full_file {
+            return;
+        }
+        if showing_full_file {
+            self.full_file_paths.insert(path_key.clone());
+        } else {
+            self.full_file_paths.remove(&path_key);
+        }
+
+        let Some((buffer, diff, conflict_set)) = self
+            .buffer_subscriptions
+            .values()
+            .find(|subscription| subscription.path_key == path_key)
+            .map(|subscription| {
+                (
+                    subscription.display_buffer.clone(),
+                    subscription._diff.clone(),
+                    subscription._conflict_set.clone(),
+                )
+            }) else {
+            return;
+        };
+        let ranges = Self::excerpt_ranges_for(
+            &buffer,
+            &diff,
+            conflict_set.as_ref(),
+            showing_full_file,
+            cx,
+        );
+        let context_line_count = if showing_full_file {
+            0
+        } else {
+            multibuffer_context_lines(cx)
+        };
+        self.editor.update(cx, |editor, cx| {
+            editor.remove_excerpts_for_path(path_key.clone(), cx);
+            editor.update_excerpts_for_path(path_key, buffer, ranges, context_line_count, diff, cx);
+        });
+        cx.notify();
     }
 
     pub(crate) fn added_to_workspace(

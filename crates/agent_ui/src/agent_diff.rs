@@ -42,6 +42,7 @@ pub struct AgentDiffPane {
     multibuffer: Entity<MultiBuffer>,
     editor: Entity<SplittableEditor>,
     thread: Entity<AcpThread>,
+    full_file_paths: HashSet<PathKey>,
     focus_handle: FocusHandle,
     workspace: WeakEntity<Workspace>,
     _subscriptions: Vec<Subscription>,
@@ -122,6 +123,7 @@ impl AgentDiffPane {
             multibuffer,
             editor,
             thread,
+            full_file_paths: Default::default(),
             focus_handle,
             workspace,
         };
@@ -163,23 +165,33 @@ impl AgentDiffPane {
 
             let snapshot = buffer.read(cx).snapshot();
 
-            let diff_hunk_ranges = diff_handle
-                .read(cx)
-                .snapshot(cx)
-                .hunks_intersecting_range(
-                    language::Anchor::min_max_range_for_buffer(snapshot.remote_id()),
-                    &snapshot,
-                )
-                .map(|diff_hunk| diff_hunk.buffer_range.to_point(&snapshot))
-                .collect::<Vec<_>>();
+            let showing_full_file = self.full_file_paths.contains(&path_key);
+            let ranges = if showing_full_file {
+                vec![Point::zero()..snapshot.max_point()]
+            } else {
+                diff_handle
+                    .read(cx)
+                    .snapshot(cx)
+                    .hunks_intersecting_range(
+                        language::Anchor::min_max_range_for_buffer(snapshot.remote_id()),
+                        &snapshot,
+                    )
+                    .map(|diff_hunk| diff_hunk.buffer_range.to_point(&snapshot))
+                    .collect::<Vec<_>>()
+            };
+            let context_line_count = if showing_full_file {
+                0
+            } else {
+                multibuffer_context_lines(cx)
+            };
 
             let was_empty = self.multibuffer.read(cx).is_empty();
             let is_excerpt_newly_added = self.editor.update(cx, |editor, cx| {
                 editor.update_excerpts_for_path(
                     path_key.clone(),
                     buffer.clone(),
-                    diff_hunk_ranges,
-                    multibuffer_context_lines(cx),
+                    ranges,
+                    context_line_count,
                     diff_handle.clone(),
                     cx,
                 )
@@ -233,6 +245,88 @@ impl AgentDiffPane {
                 editor.focus_handle(cx).focus(window, cx);
             });
         }
+    }
+
+    /// Returns the [`PathKey`] of the excerpt the cursor currently sits in, if any.
+    fn active_path_key(&self, cx: &App) -> Option<PathKey> {
+        let editor = self.editor.read(cx).focused_editor().read(cx);
+        let multibuffer = editor.buffer().read(cx);
+        let position = editor.selections.newest_anchor().head();
+        let snapshot = multibuffer.snapshot(cx);
+        let (text_anchor, _) = snapshot.anchor_to_buffer_anchor(position)?;
+        let buffer = multibuffer.buffer(text_anchor.buffer_id)?;
+        Some(PathKey::for_buffer(&buffer, cx))
+    }
+
+    pub(crate) fn showing_full_file_for_active(&self, cx: &App) -> bool {
+        self.active_path_key(cx)
+            .is_some_and(|path_key| self.full_file_paths.contains(&path_key))
+    }
+
+    pub(crate) fn toggle_showing_full_file_for_active(&mut self, cx: &mut Context<Self>) {
+        let Some(path_key) = self.active_path_key(cx) else {
+            return;
+        };
+        let showing_full_file = !self.full_file_paths.contains(&path_key);
+        self.set_showing_full_file(path_key, showing_full_file, cx);
+    }
+
+    /// Toggles whether the focused file is shown in full (whole buffer) or as hunks only. Re-lays
+    /// out just that file's excerpts, so other files in the review pane are unaffected.
+    pub(crate) fn set_showing_full_file(
+        &mut self,
+        path_key: PathKey,
+        showing_full_file: bool,
+        cx: &mut Context<Self>,
+    ) {
+        let already_full_file = self.full_file_paths.contains(&path_key);
+        if already_full_file == showing_full_file {
+            return;
+        }
+        if showing_full_file {
+            self.full_file_paths.insert(path_key.clone());
+        } else {
+            self.full_file_paths.remove(&path_key);
+        }
+
+        let (buffer, diff_handle) = {
+            let Some((buffer, diff_handle)) = self
+                .thread
+                .read(cx)
+                .action_log()
+                .read(cx)
+                .changed_buffers(cx)
+                .find(|(buffer, _)| PathKey::for_buffer(buffer, cx) == path_key)
+            else {
+                return;
+            };
+            (buffer, diff_handle)
+        };
+
+        let snapshot = buffer.read(cx).snapshot();
+        let ranges = if showing_full_file {
+            vec![Point::zero()..snapshot.max_point()]
+        } else {
+            diff_handle
+                .read(cx)
+                .snapshot(cx)
+                .hunks_intersecting_range(
+                    language::Anchor::min_max_range_for_buffer(snapshot.remote_id()),
+                    &snapshot,
+                )
+                .map(|diff_hunk| diff_hunk.buffer_range.to_point(&snapshot))
+                .collect::<Vec<_>>()
+        };
+        let context_line_count = if showing_full_file {
+            0
+        } else {
+            multibuffer_context_lines(cx)
+        };
+        self.editor.update(cx, |editor, cx| {
+            editor.remove_excerpts_for_path(path_key.clone(), cx);
+            editor.update_excerpts_for_path(path_key, buffer, ranges, context_line_count, diff_handle, cx);
+        });
+        cx.notify();
     }
 
     fn handle_acp_thread_event(&mut self, event: &AcpThreadEvent, cx: &mut Context<Self>) {
@@ -1270,6 +1364,23 @@ impl Render for AgentDiffToolbar {
                                     })),
                             ),
                     )
+                    .child({
+                        let showing_full_file =
+                            agent_diff.read(cx).showing_full_file_for_active(cx);
+                        let (icon, tooltip) = if showing_full_file {
+                            (IconName::ChevronDownUp, "Show Changes Only")
+                        } else {
+                            (IconName::ChevronUpDown, "Show Full File")
+                        };
+                        IconButton::new("pane-toggle-full-file", icon)
+                            .icon_size(IconSize::Small)
+                            .tooltip(Tooltip::text(tooltip))
+                            .on_click(cx.listener(move |_, _, _, cx| {
+                                agent_diff.update(cx, |agent_diff, cx| {
+                                    agent_diff.toggle_showing_full_file_for_active(cx);
+                                });
+                            }))
+                    })
                     .into_any()
             }
         }

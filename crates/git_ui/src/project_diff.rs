@@ -304,6 +304,17 @@ impl ProjectDiff {
         self.diff.read(cx).multibuffer().clone()
     }
 
+    /// Whether the focused file in the diff is shown in full (whole file) vs. hunks only.
+    pub fn showing_full_file(&self, cx: &App) -> bool {
+        self.diff.read(cx).showing_full_file_for_active(cx)
+    }
+
+    /// Toggles the focused file between full-file and hunks-only.
+    pub fn toggle_showing_full_file(&mut self, cx: &mut Context<Self>) {
+        self.diff
+            .update(cx, |diff, cx| diff.toggle_showing_full_file_for_active(cx));
+    }
+
     fn button_states(&self, cx: &App) -> ButtonStates {
         let diff = self.diff.read(cx);
         let editor = diff.editor().read(cx).rhs_editor().clone();
@@ -794,6 +805,7 @@ impl Render for ProjectDiffToolbar {
         };
         let focus_handle = project_diff.focus_handle(cx);
         let button_states = project_diff.read(cx).button_states(cx);
+        let showing_full_file = project_diff.read(cx).showing_full_file(cx);
         let review_count = project_diff.read(cx).total_review_comment_count(cx);
 
         let (additions, deletions) = project_diff.read(cx).calculate_changed_lines(cx);
@@ -845,6 +857,29 @@ impl Render for ProjectDiffToolbar {
                                 this.dispatch_action(&GoToHunk, window, cx)
                             })),
                     ),
+            )
+            .child(
+                IconButton::new(
+                    "toggle-full-file",
+                    if showing_full_file {
+                        IconName::ChevronDownUp
+                    } else {
+                        IconName::ChevronUpDown
+                    },
+                )
+                .icon_size(IconSize::Small)
+                .tooltip(Tooltip::text(if showing_full_file {
+                    "Show Changes Only"
+                } else {
+                    "Show Full File"
+                }))
+                .on_click(cx.listener(|this, _, _window, cx| {
+                    if let Some(project_diff) = this.project_diff(cx) {
+                        project_diff.update(cx, |project_diff, cx| {
+                            project_diff.toggle_showing_full_file(cx);
+                        });
+                    }
+                })),
             )
             .child(Divider::vertical())
             .child(
