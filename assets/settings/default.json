@@ -1201,7 +1201,7 @@
       },
     },
     // When enabled, agent edits will be displayed in single-file editors for review
-    "single_file_review": false,
+    "single_file_review": true,
     // Settings for automatic agent context compaction, which summarizes earlier
     // messages to free up room in the model's context window once it grows too
     // large.
