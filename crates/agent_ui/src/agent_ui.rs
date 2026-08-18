@@ -58,7 +58,7 @@ use language::{
 use language_model::{
     ConfiguredModel, LanguageModelId, LanguageModelProviderId, LanguageModelRegistry,
 };
-use project::{AgentId, DisableAiSettings};
+use project::{AgentId, DisableAiSettings, Project, image_store};
 use prompt_store::{self, PromptBuilder, rules_to_skills_migration};
 use rope::Point;
 use schemars::JsonSchema;
@@ -95,6 +95,8 @@ pub use zed_actions::{CreateWorktree, NewWorktreeBranchTarget, SwitchWorktree};
 pub(crate) fn resolve_agent_image(
     dest_url: &str,
     worktree_roots: &[PathBuf],
+    project: Option<&Entity<Project>>,
+    cx: &App,
 ) -> Option<ImageSource> {
     if dest_url.starts_with("http://") || dest_url.starts_with("https://") {
         return Some(ImageSource::Resource(Resource::Uri(SharedUri::from(
@@ -103,12 +105,33 @@ pub(crate) fn resolve_agent_image(
     }
 
     let path = Path::new(dest_url);
-    if path.is_absolute() && path.exists() {
-        return Some(ImageSource::Resource(Resource::Path(Arc::from(path))));
-    }
+    let candidates: Vec<PathBuf> = if path.is_absolute() {
+        vec![path.to_path_buf()]
+    } else {
+        worktree_roots
+            .iter()
+            .map(|root| root.join(dest_url))
+            .collect()
+    };
 
-    for root in worktree_roots {
-        let absolute_path = root.join(dest_url);
+    for absolute_path in candidates {
+        if let Some(project) = project
+            && let Some(project_path) =
+                project.read(cx).project_path_for_absolute_path(&absolute_path, cx)
+            && let Some(worktree) = project
+                .read(cx)
+                .worktree_for_id(project_path.worktree_id, cx)
+            && !worktree.read(cx).is_local()
+        {
+            // The image only exists on the remote host, so load it through the
+            // project's remote-aware image store instead of the local
+            // filesystem.
+            return Some(image_store::project_image_source(
+                project.downgrade(),
+                project_path,
+            ));
+        }
+
         if absolute_path.exists() {
             return Some(ImageSource::Resource(Resource::Path(Arc::from(
                 absolute_path.as_path(),
