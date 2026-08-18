@@ -20,7 +20,8 @@ pub const PARSE_OPTIONS: Options = Options::ENABLE_TABLES
     .union(Options::ENABLE_OLD_FOOTNOTES)
     .union(Options::ENABLE_GFM)
     .union(Options::ENABLE_SUPERSCRIPT)
-    .union(Options::ENABLE_SUBSCRIPT);
+    .union(Options::ENABLE_SUBSCRIPT)
+    .union(Options::ENABLE_MATH);
 
 #[derive(Default)]
 struct ParseState {
@@ -657,7 +658,14 @@ pub(crate) fn parse_markdown_with_options(
             pulldown_cmark::Event::TaskListMarker(checked) => {
                 state.push_event(range, MarkdownEvent::TaskListMarker(checked))
             }
-            pulldown_cmark::Event::InlineMath(_) | pulldown_cmark::Event::DisplayMath(_) => {}
+            pulldown_cmark::Event::InlineMath(math) => state.push_event(
+                range,
+                MarkdownEvent::InlineMath(SharedString::from(math.into_string())),
+            ),
+            pulldown_cmark::Event::DisplayMath(math) => state.push_event(
+                range,
+                MarkdownEvent::DisplayMath(SharedString::from(math.into_string())),
+            ),
         }
     }
 
@@ -778,6 +786,10 @@ pub enum MarkdownEvent {
     Rule,
     /// A task list marker, rendered as a checkbox in HTML. Contains a true when it is checked.
     TaskListMarker(bool),
+    /// Inline math (`$…$`) with the LaTeX source.
+    InlineMath(SharedString),
+    /// Display math (`$$…$$`) with the LaTeX source.
+    DisplayMath(SharedString),
     /// Start of a root-level block (a top-level structural element like a paragraph, heading, list, etc.).
     RootStart,
     /// End of a root-level block. Contains the root block index.
@@ -969,9 +981,7 @@ mod tests {
     use super::*;
 
     const CONDITIONAL_OPTIONS: Options = Options::ENABLE_YAML_STYLE_METADATA_BLOCKS;
-    const UNWANTED_OPTIONS: Options = Options::ENABLE_MATH
-        .union(Options::ENABLE_DEFINITION_LIST)
-        .union(Options::ENABLE_WIKILINKS);
+    const UNWANTED_OPTIONS: Options = Options::ENABLE_DEFINITION_LIST.union(Options::ENABLE_WIKILINKS);
 
     #[test]
     fn all_options_considered() {
@@ -993,6 +1003,22 @@ mod tests {
                 .intersection(UNWANTED_OPTIONS),
             Options::empty()
         );
+    }
+
+    #[test]
+    fn test_math_events() {
+        let events =
+            parse_markdown_with_options("Inline $x^2$ here.\n\n$$E = mc^2$$", false, false, false)
+                .events;
+        let math_events = events
+            .iter()
+            .filter_map(|(_, event)| match event {
+                InlineMath(source) => Some((false, source.as_ref())),
+                DisplayMath(source) => Some((true, source.as_ref())),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(math_events, vec![(false, "x^2"), (true, "E = mc^2")]);
     }
 
     #[test]

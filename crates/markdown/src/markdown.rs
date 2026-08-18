@@ -1,4 +1,5 @@
 pub mod html;
+mod math;
 mod mermaid;
 pub mod parser;
 mod path_range;
@@ -12,6 +13,7 @@ use gpui::UnderlineStyle;
 use language::LanguageName;
 
 use log::Level;
+use math::{MathState, ParsedMathExpression, extract_math_expressions};
 use mermaid::{
     MermaidState, ParsedMarkdownMermaidDiagram, extract_mermaid_diagrams, render_mermaid_diagram,
 };
@@ -36,9 +38,10 @@ use gpui::{
     AnyElement, App, BorderStyle, Bounds, ClipboardItem, CursorStyle, DispatchPhase, Edges, Entity,
     FocusHandle, Focusable, FontStyle, FontWeight, GlobalElementId, Hitbox, Hsla, Image,
     ImageFormat, ImageSource, KeyContext, Length, MouseButton, MouseDownEvent, MouseEvent,
-    MouseMoveEvent, MouseUpEvent, Point, ScrollHandle, Stateful, StrikethroughStyle,
-    StyleRefinement, StyledImage, StyledText, Subscription, Task, TextAlign, TextLayout, TextRun,
-    TextStyle, TextStyleRefinement, WrappedLineLayout, actions, canvas, img, point, quad,
+    MouseMoveEvent, MouseUpEvent, Point, Resource, ScrollHandle, SharedUri, Stateful,
+    StrikethroughStyle, StyleRefinement, StyledImage, StyledText, Subscription, Task, TextAlign,
+    TextLayout, TextRun, TextStyle, TextStyleRefinement, WrappedLineLayout, actions, canvas, img,
+    point, quad,
 };
 use language::{CharClassifier, Language, LanguageRegistry, Rope};
 use parser::CodeBlockMetadata;
@@ -463,6 +466,7 @@ pub struct Markdown {
     fallback_code_block_language: Option<LanguageName>,
     options: MarkdownOptions,
     mermaid_state: MermaidState,
+    math_state: MathState,
     _mermaid_theme_subscription: Option<Subscription>,
     /// Per-diagram view state (current tab, zoom, scroll position, and pending
     /// debounced re-raster) keyed by source offset. Distinct from
@@ -480,13 +484,29 @@ pub struct Markdown {
     active_search_highlight: Option<usize>,
 }
 
-#[derive(Clone, Copy, Default)]
+#[derive(Clone, Copy)]
 pub struct MarkdownOptions {
     pub parse_links_only: bool,
     pub parse_html: bool,
     pub render_mermaid_diagrams: bool,
     pub parse_heading_slugs: bool,
     pub render_metadata_blocks: bool,
+    /// Whether to render `$…$` and `$$…$$` LaTeX math as images. Defaults to
+    /// true; when disabled, the raw source (including delimiters) is shown.
+    pub render_math: bool,
+}
+
+impl Default for MarkdownOptions {
+    fn default() -> Self {
+        Self {
+            parse_links_only: false,
+            parse_html: false,
+            render_mermaid_diagrams: false,
+            parse_heading_slugs: false,
+            render_metadata_blocks: false,
+            render_math: true,
+        }
+    }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -636,10 +656,16 @@ impl Markdown {
     ) -> Self {
         let focus_handle = cx.focus_handle();
 
-        let theme_subscription = if options.render_mermaid_diagrams {
+        let theme_subscription = if options.render_mermaid_diagrams || options.render_math {
             Some(
                 cx.observe_global::<theme::GlobalTheme>(|this: &mut Self, cx| {
                     this.invalidate_mermaid_cache(cx);
+                    if this.options.render_math {
+                        this.math_state.clear();
+                        this.math_state
+                            .update(&this.parsed_markdown.math_expressions, cx);
+                        cx.notify();
+                    }
                 }),
             )
         } else {
@@ -663,6 +689,7 @@ impl Markdown {
             fallback_code_block_language,
             options,
             mermaid_state: MermaidState::default(),
+            math_state: MathState::default(),
             _mermaid_theme_subscription: theme_subscription,
             mermaid_views: HashMap::default(),
             copied_code_blocks: HashSet::default(),
@@ -685,6 +712,7 @@ impl Markdown {
             None,
             MarkdownOptions {
                 parse_links_only: true,
+                render_math: false,
                 ..Default::default()
             },
             cx,
@@ -1197,6 +1225,7 @@ impl Markdown {
         let should_parse_links_only = self.options.parse_links_only;
         let should_parse_html = self.options.parse_html;
         let should_render_mermaid_diagrams = self.options.render_mermaid_diagrams;
+        let should_render_math = self.options.render_math;
         let should_parse_heading_slugs = self.options.parse_heading_slugs;
         let should_parse_metadata_blocks = self.options.render_metadata_blocks;
         let language_registry = self.language_registry.clone();
@@ -1214,6 +1243,7 @@ impl Markdown {
                         html_blocks: BTreeMap::default(),
                         metadata_blocks: BTreeMap::default(),
                         mermaid_diagrams: BTreeMap::default(),
+                        math_expressions: BTreeMap::default(),
                         heading_slugs: HashMap::default(),
                         footnote_definitions: HashMap::default(),
                     },
@@ -1237,6 +1267,11 @@ impl Markdown {
             let footnote_definitions = parsed.footnote_definitions;
             let mermaid_diagrams = if should_render_mermaid_diagrams {
                 extract_mermaid_diagrams(&source, &events)
+            } else {
+                BTreeMap::default()
+            };
+            let math_expressions = if should_render_math {
+                extract_math_expressions(&events)
             } else {
                 BTreeMap::default()
             };
@@ -1274,18 +1309,24 @@ impl Markdown {
                     let Some((mime_info, data)) = data_url.split_once(',') else {
                         continue;
                     };
-                    let Some((mime_type, encoding)) = mime_info.split_once(';') else {
-                        continue;
-                    };
+                    let mut parameters = mime_info.split(';');
+                    let mime_type = parameters.next().unwrap_or_default();
+                    let is_base64 = parameters.any(|parameter| {
+                        parameter.eq_ignore_ascii_case("base64")
+                    });
                     let Some(format) = ImageFormat::from_mime_type(mime_type) else {
                         continue;
                     };
-                    let is_base64 = encoding == "base64";
-                    if is_base64
-                        && let Some(bytes) = base64::prelude::BASE64_STANDARD
+                    let bytes = if is_base64 {
+                        base64::prelude::BASE64_STANDARD
                             .decode(data)
                             .log_with_level(Level::Debug)
-                    {
+                    } else {
+                        urlencoding::decode(data)
+                            .map(|decoded| decoded.into_owned().into_bytes())
+                            .log_with_level(Level::Debug)
+                    };
+                    if let Some(bytes) = bytes {
                         let image = Arc::new(Image::from_bytes(format, bytes));
                         images_by_source_offset.insert(range.start, image);
                     }
@@ -1302,6 +1343,7 @@ impl Markdown {
                     html_blocks,
                     metadata_blocks,
                     mermaid_diagrams,
+                    math_expressions,
                     heading_slugs,
                     footnote_definitions,
                 },
@@ -1337,6 +1379,12 @@ impl Markdown {
                 } else {
                     this.mermaid_state.clear(cx);
                     this.mermaid_views.clear();
+                }
+                if this.options.render_math {
+                    this.math_state
+                        .update(&this.parsed_markdown.math_expressions, cx);
+                } else {
+                    this.math_state.clear();
                 }
                 this.pending_parse.take();
                 if this.should_reparse {
@@ -1448,6 +1496,7 @@ pub struct ParsedMarkdown {
     pub(crate) html_blocks: BTreeMap<usize, html::html_parser::ParsedHtmlBlock>,
     pub(crate) metadata_blocks: BTreeMap<usize, ParsedMetadataBlock>,
     pub(crate) mermaid_diagrams: BTreeMap<usize, ParsedMarkdownMermaidDiagram>,
+    pub(crate) math_expressions: BTreeMap<usize, ParsedMathExpression>,
     pub heading_slugs: HashMap<SharedString, usize>,
     pub footnote_definitions: HashMap<SharedString, usize>,
 }
@@ -1684,6 +1733,58 @@ impl MarkdownElement {
             builder.push_text_style(code_style);
             builder.push_text(text, range);
             builder.pop_text_style();
+        }
+    }
+
+    fn push_markdown_math(
+        &self,
+        builder: &mut MarkdownElementBuilder,
+        parsed_markdown: &ParsedMarkdown,
+        math_state: &MathState,
+        render_math: bool,
+        source: &SharedString,
+        display: bool,
+        range: Range<usize>,
+        window: &mut Window,
+    ) {
+        let render_image = render_math
+            .then(|| parsed_markdown.math_expressions.get(&range.start))
+            .flatten()
+            .and_then(|expression| math_state.get(expression))
+            .and_then(|cached| cached.image())
+            .and_then(|image| image.as_ref().ok().cloned());
+
+        if let Some(render_image) = render_image {
+            // SVGs rasterize at a fixed font size (see `math::SVG_FONT_SIZE`);
+            // scale the image so one glyph em matches one em of the surrounding
+            // text. The rasterization runs at twice the logical size, hence the
+            // division by `SMOOTH_SVG_SCALE_FACTOR`'s value.
+            let font_size = self.style.base_text_style.font_size.to_pixels(window.rem_size());
+            let scale =
+                font_size.as_f32() / math::SVG_FONT_SIZE as f32 * if display { 1.2 } else { 1. };
+            let size = render_image.size(0);
+            let element = img(ImageSource::Render(render_image)).max_w_full();
+            let element = if size.height.0 > 0 {
+                let logical_width = size.width.0 as f32 / 2.;
+                let logical_height = size.height.0 as f32 / 2.;
+                element
+                    .w(px(logical_width * scale))
+                    .h(px(logical_height * scale))
+            } else {
+                element
+            };
+
+            if display {
+                builder.push_sourced_element(range, element.into_any_element());
+            } else {
+                builder.push_image_child(element);
+            }
+        } else {
+            // Rendering is disabled, still in flight, or failed; show the raw
+            // source the way markdown without math support would.
+            let delimiter = if display { "$$" } else { "$" };
+            let literal = format!("{delimiter}{source}{delimiter}");
+            builder.push_text(&literal, range);
         }
     }
 
@@ -2412,7 +2513,15 @@ impl Element for MarkdownElement {
             self.style.base_text_style.clone(),
             self.style.syntax.clone(),
         );
-        let (parsed_markdown, images, active_root_block, render_mermaid_diagrams, mermaid_state) = {
+        let (
+            parsed_markdown,
+            images,
+            active_root_block,
+            render_mermaid_diagrams,
+            mermaid_state,
+            render_math,
+            math_state,
+        ) = {
             let markdown = self.markdown.read(cx);
             (
                 markdown.parsed_markdown.clone(),
@@ -2420,6 +2529,8 @@ impl Element for MarkdownElement {
                 markdown.active_root_block,
                 markdown.options.render_mermaid_diagrams,
                 markdown.mermaid_state.clone(),
+                markdown.options.render_math,
+                markdown.math_state.clone(),
             )
         };
         let markdown_end = if let Some(last) = parsed_markdown.events.last() {
@@ -2506,6 +2617,21 @@ impl Element for MarkdownElement {
                                     &mut builder,
                                     range,
                                     source,
+                                    dest_url.clone(),
+                                    alt_text,
+                                    None,
+                                    None,
+                                );
+                            } else if dest_url.starts_with("http://") || dest_url.starts_with("https://") {
+                                // Consumers without an image resolver still render web images;
+                                // GPUI fetches and caches `Resource::Uri` asynchronously.
+                                current_img_block_range = Some(range.clone());
+                                self.push_markdown_image(
+                                    &mut builder,
+                                    range,
+                                    ImageSource::Resource(Resource::Uri(SharedUri::from(
+                                        dest_url.to_string(),
+                                    ))),
                                     dest_url.clone(),
                                     alt_text,
                                     None,
@@ -3026,6 +3152,30 @@ impl Element for MarkdownElement {
                     MarkdownTagEnd::MetadataBlock(_) => {}
                     _ => log::debug!("unsupported markdown tag end: {:?}", tag),
                 },
+                MarkdownEvent::InlineMath(source) => {
+                    self.push_markdown_math(
+                        &mut builder,
+                        &parsed_markdown,
+                        &math_state,
+                        render_math,
+                        source,
+                        false,
+                        range.clone(),
+                        window,
+                    );
+                }
+                MarkdownEvent::DisplayMath(source) => {
+                    self.push_markdown_math(
+                        &mut builder,
+                        &parsed_markdown,
+                        &math_state,
+                        render_math,
+                        source,
+                        true,
+                        range.clone(),
+                        window,
+                    );
+                }
                 MarkdownEvent::Text => {
                     builder.push_text(&parsed_markdown.source[range.clone()], range.clone());
                 }

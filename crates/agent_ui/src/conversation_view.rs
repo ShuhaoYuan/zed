@@ -3458,6 +3458,7 @@ fn render_agent_markdown(
 ) -> MarkdownElement {
     let workspace = workspace.clone();
     let worktree_roots = code_span_resolver.worktree_roots(cx);
+    let project = code_span_resolver.project();
     let resolver = code_span_resolver.clone();
     MarkdownElement::new(markdown, style)
         .code_block_renderer(markdown::CodeBlockRenderer::Default {
@@ -3465,7 +3466,9 @@ fn render_agent_markdown(
             wrap_button_visibility: markdown::WrapButtonVisibility::VisibleOnHover,
             border: false,
         })
-        .image_resolver(move |dest_url, _cx| resolve_agent_image(dest_url, &worktree_roots))
+        .image_resolver(move |dest_url, cx| {
+            resolve_agent_image(dest_url, &worktree_roots, project.as_ref(), cx)
+        })
         .on_url_click(move |text, window, cx| {
             thread_view::open_link(text, &workspace, window, cx);
         })
@@ -3502,6 +3505,10 @@ impl AgentCodeSpanResolver {
 
     pub(crate) fn clear_cache(&self) {
         self.inner.cache.lock().clear();
+    }
+
+    fn project(&self) -> Option<Entity<Project>> {
+        self.inner.project.upgrade()
     }
 
     /// Absolute paths of every current worktree.
