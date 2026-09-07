@@ -29,7 +29,7 @@ use settings::{GitPanelGroupBy, GitPanelSortBy, Settings, SettingsStore};
 use std::{collections::BTreeMap, sync::Arc};
 use theme::ActiveTheme;
 use ui::{CommonAnimationExt as _, KeyBinding, prelude::*};
-use util::{ResultExt as _, rel_path::RelPath};
+use util::rel_path::RelPath;
 use workspace::{
     CloseActiveItem, ItemNavHistory, Workspace,
     item::{Item, SaveOptions},
@@ -679,7 +679,25 @@ impl DiffMultibuffer {
         let mut buffers_to_fold = Vec::new();
 
         for (path_key, entry) in entries {
-            if let Some(loaded_buffer) = entry.load.await.log_err() {
+            if let Some(loaded_buffer) = entry
+                .load
+                .await
+                .inspect_err(|error| {
+                    // Binary files cannot be opened as buffers, so diff views
+                    // skip them; only real load failures are worth logging as
+                    // errors. The message is matched as text because it may be
+                    // wrapped in an RPC error when the project is remote.
+                    if error
+                        .chain()
+                        .any(|cause| cause.to_string().contains("Binary files are not supported"))
+                    {
+                        log::debug!("skipping binary file {:?} in diff view", entry.repo_path);
+                    } else {
+                        log::error!("{error:#}");
+                    }
+                })
+                .ok()
+            {
                 // We might be lagging behind enough that all future entry.load futures are no longer pending.
                 // If that is the case, this task will never yield, starving the foreground thread of execution time.
                 yield_now().await;
