@@ -20,6 +20,8 @@ use agent_settings::UserAgentsMd;
 use agent_skills::MAX_SKILL_DESCRIPTION_LEN;
 use cloud_api_types::{SubmitAgentThreadFeedbackBody, SubmitAgentThreadFeedbackCommentsBody};
 use editor::actions::OpenExcerpts;
+use git_ui::{diff_entry_for_project_path, solo_diff_view::SoloDiffView};
+use project::ProjectItem;
 use sandbox::{SandboxFsPolicy, SandboxNetPolicy, SandboxPolicy};
 
 use crate::completion_provider::{AvailableSkill, PromptLocalCommand, pluralize};
@@ -46,7 +48,7 @@ use ui::{
     SplitButtonStyle, Tab, ToggleState,
 };
 use util::markdown::{source_position_from_fragment, split_local_url_fragment};
-use workspace::{OpenOptions, SERIALIZATION_THROTTLE_TIME};
+use workspace::{OpenOptions, SERIALIZATION_THROTTLE_TIME, notifications::NotifyTaskExt};
 
 use super::elicitation::{
     ElicitationCard, ElicitationCardHandlers, ElicitationFormState, should_render_elicitation,
@@ -1333,7 +1335,7 @@ impl ThreadView {
     }
 
     fn open_diff_location(
-        &self,
+        &mut self,
         path: &str,
         position: Point,
         split: bool,
@@ -1346,6 +1348,35 @@ impl ThreadView {
         let Some(project_path) = project.read(cx).find_project_path(path, cx) else {
             return;
         };
+
+        // Prefer a diff of the agent's edits over opening the plain file: the
+        // review pane for buffers tracked by the action log, otherwise the
+        // single-file git diff, since agents that write files themselves (most
+        // external ACP agents) only surface in Zed as uncommitted changes.
+        let edited_buffer = self
+            .thread
+            .read(cx)
+            .action_log()
+            .read(cx)
+            .changed_buffers(cx)
+            .map(|(buffer, _)| buffer)
+            .find(|buffer| {
+                buffer
+                    .read(cx)
+                    .project_path(cx)
+                    .is_some_and(|buffer_path| buffer_path == project_path)
+            });
+        if let Some(buffer) = edited_buffer {
+            self.open_edited_buffer(&buffer, window, cx);
+            return;
+        }
+
+        if let Some((entry, repository)) = diff_entry_for_project_path(&project, &project_path, cx)
+        {
+            SoloDiffView::open_or_focus(entry, repository, self.workspace.clone(), window, cx)
+                .detach_and_notify_err(self.workspace.clone(), window, cx);
+            return;
+        }
 
         let open_task = if split {
             self.workspace
@@ -8607,7 +8638,7 @@ impl ThreadView {
                                     })
                                     .when(tool_call_output_focus, |this| {
                                         this.child(
-                                            Button::new("open-file-button", "Open File")
+                                            Button::new("open-diff-button", "Open Diff")
                                                 .style(ButtonStyle::Outlined)
                                                 .label_size(LabelSize::Small)
                                                 .key_binding(

@@ -16,7 +16,7 @@ use gpui::{
     SharedString, Subscription, Task, TaskExt, WeakEntity, Window,
 };
 use menu::{Cancel, Confirm};
-use project::git_store::Repository;
+use project::{Project, ProjectPath, git_store::Repository};
 use project_diff::ProjectDiff;
 use time::OffsetDateTime;
 use ui::{ButtonLike, ContextMenu, ElevationIndex, PopoverMenuHandle, TintColor, prelude::*};
@@ -379,21 +379,21 @@ fn open_file_diff(
     });
 }
 
-fn file_diff_entry(
-    workspace: &Workspace,
+/// Looks up the repository and status entry for a project path, so callers
+/// outside this crate can open single-file diffs (e.g. `SoloDiffView`).
+pub fn diff_entry_for_project_path(
+    project: &Entity<Project>,
+    project_path: &ProjectPath,
     cx: &App,
 ) -> Option<(GitStatusEntry, Entity<Repository>)> {
-    let project_path = workspace.active_item(cx)?.project_path(cx)?;
-
-    workspace
-        .project()
+    project
         .read(cx)
         .repositories(cx)
         .values()
         .find_map(|repository| {
             let repo_path = repository
                 .read(cx)
-                .project_path_to_repo_path(&project_path, cx)?;
+                .project_path_to_repo_path(project_path, cx)?;
             let status_entry = repository.read(cx).status_for_path(&repo_path)?;
             Some((
                 GitStatusEntry {
@@ -405,6 +405,14 @@ fn file_diff_entry(
                 repository.clone(),
             ))
         })
+}
+
+fn file_diff_entry(
+    workspace: &Workspace,
+    cx: &App,
+) -> Option<(GitStatusEntry, Entity<Repository>)> {
+    let project_path = workspace.active_item(cx)?.project_path(cx)?;
+    diff_entry_for_project_path(workspace.project(), &project_path, cx)
 }
 
 fn open_modified_files(
@@ -1450,5 +1458,76 @@ mod view_commit_tests {
 
         assert!(!initial_modal_state);
         assert!(final_modal_state);
+    }
+
+    #[gpui::test]
+    async fn test_diff_entry_for_project_path(cx: &mut TestAppContext) {
+        init_test(cx);
+        let fs = FakeFs::new(cx.background_executor.clone());
+        fs.insert_tree(
+            "/root",
+            json!({
+                "project": {
+                    ".git": {},
+                    "src": {
+                        "main.rs": "fn main() {}",
+                        "lib.rs": "fn lib() {}"
+                    }
+                }
+            }),
+        )
+        .await;
+
+        fs.set_status_for_repo(
+            Path::new("/root/project/.git"),
+            &[("src/main.rs", git::status::StatusCode::Modified.worktree())],
+        );
+
+        let (project, workspace) = create_test_workspace(fs, cx).await;
+        let cx = &mut VisualTestContext::from_window(*workspace, cx);
+
+        project
+            .update(cx, |project, cx| project.git_scans_complete(cx))
+            .await;
+
+        let (status, repository_id) = workspace
+            .read_with(cx, |_, cx| {
+                let project_path = project
+                    .read(cx)
+                    .find_project_path("/root/project/src/main.rs", cx)
+                    .unwrap();
+                let (entry, repository) =
+                    diff_entry_for_project_path(&project, &project_path, cx).unwrap();
+                (entry.status, repository.read(cx).id)
+            })
+            .unwrap();
+        assert_eq!(status, git::status::StatusCode::Modified.worktree());
+        let expected_repository_id = workspace
+            .read_with(cx, |_, cx| {
+                project
+                    .read(cx)
+                    .repositories(cx)
+                    .values()
+                    .next()
+                    .unwrap()
+                    .read(cx)
+                    .id
+            })
+            .unwrap();
+        assert_eq!(repository_id, expected_repository_id);
+
+        let clean_file = workspace
+            .read_with(cx, |_, cx| {
+                let project_path = project
+                    .read(cx)
+                    .find_project_path("/root/project/src/lib.rs", cx)
+                    .unwrap();
+                diff_entry_for_project_path(&project, &project_path, cx)
+            })
+            .unwrap();
+        assert!(
+            clean_file.is_none(),
+            "files without changes have no diff entry"
+        );
     }
 }
