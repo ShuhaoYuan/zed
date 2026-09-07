@@ -510,6 +510,7 @@ dependencies = [
  "futures 0.3.32",
  "fuzzy",
  "git",
+ "git_ui",
  "git_ui_core",
  "gpui",
  "gpui_tokio",
