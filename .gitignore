@@ -60,3 +60,6 @@ crates/docs_preprocessor/actions.json
 .nixos-test-history
 
 .local*
+
+# Local release build script (not committed)
+/build-release.sh
