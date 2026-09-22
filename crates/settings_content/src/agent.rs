@@ -280,6 +280,8 @@ pub struct AgentSettingsContent {
     /// Default: never
     pub play_sound_when_agent_done: Option<PlaySoundWhenAgentDone>,
     /// Whether to display agent edits in single-file editors in addition to the review multibuffer pane.
+    /// When enabled, a file the agent is currently editing is opened automatically so its edits can
+    /// be reviewed in place.
     ///
     /// Default: true
     pub single_file_review: Option<bool>,

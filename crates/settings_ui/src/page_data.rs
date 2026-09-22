@@ -8490,7 +8490,7 @@ fn ai_page(cx: &App) -> SettingsPage {
         items.extend([
             SettingsPageItem::SettingItem(SettingItem {
                 title: "Single File Review",
-                description: "When enabled, agent edits will also be displayed in single-file buffers for review.",
+                description: "When enabled, agent edits will also be displayed in single-file buffers for review. Files the agent is editing are opened automatically.",
                 field: Box::new(SettingField {
                     organization_override: None,
                     json_path: Some("agent.single_file_review"),

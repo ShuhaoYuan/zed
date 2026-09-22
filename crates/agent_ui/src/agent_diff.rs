@@ -1403,6 +1403,10 @@ struct WorkspaceThread {
     thread: WeakEntity<AcpThread>,
     _thread_subscriptions: (Subscription, Subscription),
     singleton_editors: HashMap<WeakEntity<Buffer>, HashMap<WeakEntity<Editor>, Subscription>>,
+    /// Buffers that were opened automatically to review the agent's edits. Each
+    /// path is opened at most once per turn so that closing a tab is not undone
+    /// by the next edit to the same file.
+    auto_opened: HashSet<ProjectPath>,
     _settings_subscription: Subscription,
     _workspace_subscription: Option<Subscription>,
 }
@@ -1487,6 +1491,7 @@ impl AgentDiff {
                 thread: thread.downgrade(),
                 _thread_subscriptions: (action_log_subscription, thread_subscription),
                 singleton_editors: HashMap::default(),
+                auto_opened: HashSet::default(),
                 _settings_subscription: settings_subscription,
                 _workspace_subscription: workspace_subscription,
             },
@@ -1567,26 +1572,16 @@ impl AgentDiff {
     ) {
         match event {
             AcpThreadEvent::NewEntry => {
-                if thread
-                    .read(cx)
-                    .entries()
-                    .last()
-                    .is_some_and(|entry| entry.diffs().next().is_some())
-                {
-                    self.update_reviewing_editors(workspace, window, cx);
-                }
+                let entry_index = thread.read(cx).entries().len().checked_sub(1);
+                self.update_reviewing_editors_for_entry(workspace, thread, entry_index, window, cx);
             }
             AcpThreadEvent::EntryUpdated(ix) => {
-                if thread
-                    .read(cx)
-                    .entries()
-                    .get(*ix)
-                    .is_some_and(|entry| entry.diffs().next().is_some())
-                {
-                    self.update_reviewing_editors(workspace, window, cx);
-                }
+                self.update_reviewing_editors_for_entry(workspace, thread, Some(*ix), window, cx);
             }
             AcpThreadEvent::Stopped(_) => {
+                if let Some(workspace_thread) = self.workspace_threads.get_mut(workspace) {
+                    workspace_thread.auto_opened.clear();
+                }
                 self.update_reviewing_editors(workspace, window, cx);
             }
             AcpThreadEvent::Error | AcpThreadEvent::LoadError(_) | AcpThreadEvent::Refusal => {
@@ -1698,16 +1693,78 @@ impl AgentDiff {
             return;
         }
 
-        let Some(workspace_thread) = self.workspace_threads.get_mut(workspace) else {
-            return;
-        };
-
-        let Some(thread) = workspace_thread.thread.upgrade() else {
+        let Some(thread) = self
+            .workspace_threads
+            .get(workspace)
+            .and_then(|workspace_thread| workspace_thread.thread.upgrade())
+        else {
             return;
         };
 
         let action_log = thread.read(cx).action_log();
         let changed_buffers = action_log.read(cx).changed_buffers(cx).collect::<Vec<_>>();
+
+        // A buffer the agent has just written to is missing from
+        // `changed_buffers` until its diff has been computed, so it would not
+        // be opened until the diff lands. Collect those separately so the
+        // editor can be opened while the agent is still writing.
+        let awaiting_diff = action_log
+            .read(cx)
+            .buffers_awaiting_diff()
+            .cloned()
+            .collect::<Vec<_>>();
+
+        // Only the file the agent is currently working in is opened
+        // automatically: a run that touches many files must not spawn a tab per
+        // file. `AgentLocation` names that file for built-in tools and for
+        // agents that write through the client's filesystem alike.
+        let agent_edited_buffer = thread
+            .read(cx)
+            .project()
+            .read(cx)
+            .agent_location()
+            .map(|location| location.buffer)
+            .and_then(|buffer| buffer.upgrade());
+
+        let mut paths_to_open = Vec::new();
+        for buffer in awaiting_diff
+            .iter()
+            .chain(changed_buffers.iter().map(|(buffer, _)| buffer))
+        {
+            if buffer.read(cx).file().is_none() {
+                continue;
+            }
+
+            if agent_edited_buffer.as_ref() != Some(buffer) {
+                continue;
+            }
+
+            let is_open = self
+                .workspace_threads
+                .get(workspace)
+                .is_some_and(|workspace_thread| {
+                    workspace_thread
+                        .singleton_editors
+                        .contains_key(&buffer.downgrade())
+                });
+            if is_open {
+                continue;
+            }
+
+            if let Some(project_path) = Self::project_path_for_buffer(buffer, cx)
+                && !paths_to_open.contains(&project_path)
+            {
+                paths_to_open.push(project_path);
+            }
+        }
+
+        for project_path in paths_to_open {
+            self.open_path_for_review(workspace, project_path, window, cx);
+        }
+
+        let Some(workspace_thread) = self.workspace_threads.get_mut(workspace) else {
+            return;
+        };
 
         let mut unaffected = self.reviewing_editors.clone();
 
@@ -1798,6 +1855,85 @@ impl AgentDiff {
         }
 
         cx.notify();
+    }
+
+    /// Refreshes review editors after a tool call entry changed, opening the
+    /// file the entry's diff points at first. Agents that write files on their
+    /// own never touch the action log, so this diff is the only signal that such
+    /// a file is being edited.
+    fn update_reviewing_editors_for_entry(
+        &mut self,
+        workspace: &WeakEntity<Workspace>,
+        thread: &Entity<AcpThread>,
+        entry_index: Option<usize>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let entries = thread.read(cx).entries();
+        let last_entry_index = entries.len().checked_sub(1);
+
+        // A diff that arrives late for a tool call the agent has already moved
+        // past must not pull focus back to a file it is no longer editing.
+        let diff_path = entry_index
+            .filter(|entry_index| Some(*entry_index) == last_entry_index)
+            .and_then(|entry_index| entries.get(entry_index))
+            .and_then(|entry| entry.diffs().next())
+            .and_then(|diff| {
+                workspace.upgrade().and_then(|workspace| {
+                    Self::project_path_for_diff(workspace.read(cx).project(), diff, cx)
+                })
+            });
+
+        if let Some(project_path) = diff_path {
+            self.open_path_for_review(workspace, project_path, window, cx);
+        }
+
+        self.update_reviewing_editors(workspace, window, cx);
+    }
+
+    fn project_path_for_buffer(buffer: &Entity<Buffer>, cx: &App) -> Option<ProjectPath> {
+        buffer.read(cx).project_path(cx)
+    }
+
+    /// Resolves the file a tool call's diff points at. External agents write
+    /// files on their own rather than through the action log, so this diff is
+    /// the earliest signal that such a file is being edited.
+    fn project_path_for_diff(
+        project: &Entity<Project>,
+        diff: &Entity<acp_thread::Diff>,
+        cx: &App,
+    ) -> Option<ProjectPath> {
+        let path = diff.read(cx).file_path(cx)?;
+        project.read(cx).find_project_path(path, cx)
+    }
+
+    /// Opens `project_path` so the agent's edits to it can be reviewed in place.
+    /// A path that was already opened for this turn is left alone, so that a
+    /// run touching many files does not keep reopening tabs the user closed.
+    fn open_path_for_review(
+        &mut self,
+        workspace: &WeakEntity<Workspace>,
+        project_path: ProjectPath,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(workspace_thread) = self.workspace_threads.get_mut(workspace) else {
+            return;
+        };
+
+        if !workspace_thread.auto_opened.insert(project_path.clone()) {
+            return;
+        }
+
+        let Some(workspace) = workspace.upgrade() else {
+            return;
+        };
+
+        workspace.update(cx, |workspace, cx| {
+            workspace
+                .open_path(project_path, None, true, window, cx)
+                .detach_and_log_err(cx);
+        });
     }
 
     fn editor_state(&self, editor: &WeakEntity<Editor>) -> EditorState {
@@ -1985,7 +2121,7 @@ mod tests {
     use agent_settings::AgentSettings;
     use editor::EditorSettings;
     use gpui::{TestAppContext, UpdateGlobal, VisualTestContext};
-    use project::{FakeFs, Project};
+    use project::{AgentLocation, FakeFs, Project};
     use serde_json::json;
     use settings::{DiffViewStyle, SettingsStore};
     use std::{path::Path, rc::Rc};
@@ -2461,6 +2597,162 @@ mod tests {
         assert_eq!(
             diff_toolbar.read_with(cx, |toolbar, cx| toolbar.location(cx)),
             ToolbarItemLocation::Hidden
+        );
+    }
+
+    #[gpui::test]
+    async fn test_single_file_review_opens_unopened_file(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            let settings_store = SettingsStore::test(cx);
+            cx.set_global(settings_store);
+            prompt_store::init(cx);
+            theme_settings::init(theme::LoadThemes::JustBase, cx);
+            language_model::init(cx);
+            workspace::register_project_item::<Editor>(cx);
+        });
+
+        cx.update(|cx| {
+            SettingsStore::update_global(cx, |store, _cx| {
+                let mut agent_settings = store.get::<AgentSettings>(None).clone();
+                agent_settings.single_file_review = true;
+                store.override_global(agent_settings);
+            });
+        });
+
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(
+            path!("/test"),
+            json!({"file1": "abc\ndef\nghi\njkl\nmno\npqr\nstu\nvwx\nyz"}),
+        )
+        .await;
+
+        let project = Project::test(fs, [path!("/test").as_ref()], cx).await;
+        let buffer_path1 = project
+            .read_with(cx, |project, cx| {
+                project.find_project_path("test/file1", cx)
+            })
+            .unwrap();
+
+        let (multi_workspace, cx) =
+            cx.add_window_view(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+        let workspace = multi_workspace.read_with(cx, |mw, _| mw.workspace().clone());
+
+        let connection = Rc::new(acp_thread::StubAgentConnection::new());
+        let thread = cx
+            .update(|_, cx| {
+                connection.clone().new_session(
+                    project.clone(),
+                    PathList::new(&[Path::new(path!("/test"))]),
+                    cx,
+                )
+            })
+            .await
+            .unwrap();
+        let action_log = thread.read_with(cx, |thread, _| thread.action_log().clone());
+
+        cx.update(|window, cx| {
+            AgentDiff::set_active_thread(&workspace.downgrade(), thread.clone(), window, cx)
+        });
+        cx.run_until_parked();
+
+        let buffer1 = project
+            .update(cx, |project, cx| {
+                project.open_buffer(buffer_path1.clone(), cx)
+            })
+            .await
+            .unwrap();
+
+        // Nothing is open yet.
+        assert!(workspace.read_with(cx, |workspace, cx| workspace.active_item(cx).is_none()));
+
+        cx.update(|_, cx| {
+            action_log.update(cx, |log, cx| log.buffer_read(buffer1.clone(), cx));
+            buffer1.update(cx, |buffer, cx| {
+                buffer
+                    .edit(
+                        [
+                            (Point::new(1, 1)..Point::new(1, 2), "E"),
+                            (Point::new(3, 2)..Point::new(3, 3), "L"),
+                        ],
+                        None,
+                        cx,
+                    )
+                    .unwrap()
+            });
+            action_log.update(cx, |log, cx| log.buffer_edited(buffer1.clone(), cx));
+
+            // The built-in agent points `AgentLocation` at the file it is
+            // editing; that is what marks it as the file to open.
+            project.update(cx, |project, cx| {
+                project.set_agent_location(
+                    Some(AgentLocation {
+                        buffer: buffer1.downgrade(),
+                        position: buffer1.read(cx).anchor_before(Point::new(1, 1)),
+                    }),
+                    cx,
+                )
+            });
+        });
+        cx.run_until_parked();
+
+        let editor = workspace
+            .read_with(cx, |workspace, cx| workspace.active_item_as::<Editor>(cx))
+            .expect("the file the agent is editing should be opened");
+
+        assert_eq!(
+            editor
+                .read_with(cx, |editor, cx| editor.active_project_path(cx))
+                .unwrap(),
+            buffer_path1
+        );
+        assert_eq!(
+            editor.read_with(cx, |editor, cx| editor.text(cx)),
+            "abc\ndef\ndEf\nghi\njkl\njkL\nmno\npqr\nstu\nvwx\nyz"
+        );
+        assert_eq!(
+            editor
+                .update(cx, |editor, cx| editor
+                    .selections
+                    .newest::<Point>(&editor.display_snapshot(cx)))
+                .range(),
+            Point::new(1, 0)..Point::new(1, 0)
+        );
+        assert!(cx.update(|_, cx| {
+            AgentDiff::global(cx).read_with(cx, |diff, _cx| {
+                matches!(
+                    diff.editor_state(&editor.downgrade()),
+                    EditorState::Reviewing
+                )
+            })
+        }));
+
+        // Further edits to the same file reuse the editor that was opened
+        // rather than opening another one.
+        cx.update(|_, cx| {
+            buffer1.update(cx, |buffer, cx| {
+                buffer
+                    .edit([(Point::new(5, 0)..Point::new(5, 1), "P")], None, cx)
+                    .unwrap()
+            });
+            action_log.update(cx, |log, cx| log.buffer_edited(buffer1.clone(), cx));
+        });
+        cx.run_until_parked();
+
+        let editors_for_file = workspace.read_with(cx, |workspace, cx| {
+            workspace
+                .items_of_type::<Editor>(cx)
+                .filter(|editor| {
+                    editor
+                        .read(cx)
+                        .active_project_path(cx)
+                        .is_some_and(|path| path == buffer_path1)
+                })
+                .count()
+        });
+        assert_eq!(editors_for_file, 1);
+        assert_eq!(
+            editor.read_with(cx, |editor, cx| editor.text(cx)),
+            "abc\ndef\ndEf\nghi\njkl\njkL\nmno\npqr\nPqr\nstu\nvwx\nyz"
         );
     }
 

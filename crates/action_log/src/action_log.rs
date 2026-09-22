@@ -201,6 +201,7 @@ impl ActionLog {
                     version: buffer.read(cx).version(),
                     diff,
                     diff_update: diff_update_tx,
+                    diff_pending: false,
                     _open_lsp_handle: open_lsp_handle,
                     _maintain_diff: cx.spawn({
                         let buffer = buffer.clone();
@@ -529,6 +530,7 @@ impl ActionLog {
             tracked_buffer.diff_base = new_diff_base;
             tracked_buffer.snapshot = buffer_snapshot;
             tracked_buffer.unreviewed_edits = unreviewed_edits;
+            tracked_buffer.diff_pending = false;
             cx.notify();
             anyhow::Ok(())
         })?
@@ -608,6 +610,13 @@ impl ActionLog {
 
         tracked_buffer.version = new_version;
         tracked_buffer.schedule_diff_update(ChangeAuthor::Agent, cx);
+        tracked_buffer.diff_pending = true;
+
+        // The diff for this write has not been computed yet, so the buffer will
+        // not show up in `changed_buffers` until it has. Notify now so that
+        // observers can react to the write itself, rather than waiting for the
+        // diff to settle.
+        cx.notify();
     }
 
     pub fn will_delete_buffer(&mut self, buffer: Entity<Buffer>, cx: &mut Context<Self>) {
@@ -1042,6 +1051,16 @@ impl ActionLog {
         DiffStats::all_files(self.changed_buffers(cx), cx)
     }
 
+    /// Returns buffers the agent has written to whose diff has not been
+    /// computed yet. [`Self::changed_buffers`] reports hunks read from the
+    /// diff, so these buffers are missing from it until the diff settles.
+    pub fn buffers_awaiting_diff(&self) -> impl Iterator<Item = &Entity<Buffer>> {
+        self.tracked_buffers
+            .iter()
+            .filter(|(_, tracked)| tracked.diff_pending)
+            .map(|(buffer, _)| buffer)
+    }
+
     /// Iterate over buffers changed since last read or edited by the model
     pub fn stale_buffers<'a>(&'a self, cx: &'a App) -> impl Iterator<Item = &'a Entity<Buffer>> {
         self.tracked_buffers
@@ -1282,6 +1301,10 @@ pub struct TrackedBuffer {
     _open_lsp_handle: OpenLspBufferHandle,
     _maintain_diff: Task<()>,
     _subscription: Subscription,
+    /// Set when the agent writes to the buffer, cleared once the diff for that
+    /// write has landed in `diff`. `changed_buffers` reads hunks from `diff`,
+    /// so it cannot report a write until the diff has been computed.
+    diff_pending: bool,
 }
 
 impl TrackedBuffer {
